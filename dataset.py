@@ -7,6 +7,7 @@ from rdkit.Chem import AllChem
 from rdkit.Chem.rdMolAlign import AlignMol
 from rdkit.Chem.rdMolAlign import GetAlignmentTransform
 from mmengine.config import Config
+from tqdm import tqdm
 
 from DeepTernary.deepternary.models.process_mols import (
     distance_featurizer,
@@ -153,13 +154,12 @@ def _build_data_dict_for_complex_dir(complex_dir):
 
     return data
 
-
-def iter_data_dicts_from_ternarydb(cfg, base_dir="/home/yuliangyan/Code/Trust-App-AI-Lab/molecular_glue_design/data/TernaryDB/pdbs"):
+def iter_data_dicts_from_ternarydb(base_dir: str = "./data/TernaryDB/pdbs"):
     """
-    Iterate over all complex directories under base_dir and yield (name, data_dict).
+    Iterate all complex subdirectories under base_dir and yield (name, data_dict).
     Only directories containing ligand.pdb, protein1.pdb, protein2.pdb are considered.
     """
-    for entry in sorted(os.listdir(base_dir)):
+    for entry in tqdm(sorted(os.listdir(base_dir))):
         complex_dir = os.path.join(base_dir, entry)
         if not os.path.isdir(complex_dir):
             continue
@@ -174,9 +174,14 @@ def iter_data_dicts_from_ternarydb(cfg, base_dir="/home/yuliangyan/Code/Trust-Ap
         except Exception as e:
             print(f"Skip {entry}: {e}")
 
-if __name__ == '__main__':
-    # Minimal entry: load config and build data dicts for all complexes under TernaryDB/pdbs
 
-    complex_dir = "./data/TernaryDB/MGD_test/1NSG_A_B_RAD"
-    data = _build_data_dict_for_complex_dir(complex_dir=complex_dir)
-    print(data)
+def build_all_data_dicts_from_ternarydb(base_dir: str = "./data/TernaryDB/pdbs"):
+    """Return a list of (name, data_dict) for all valid complexes under base_dir."""
+    return list(iter_data_dicts_from_ternarydb(base_dir))
+
+
+if __name__ == '__main__':
+    base_dir = "./data/TernaryDB/pdbs"
+    dataset = build_all_data_dicts_from_ternarydb(base_dir)
+    print(dataset[0:2])
+    print(f"Built dataset for {len(dataset)} complexes under {base_dir}")
