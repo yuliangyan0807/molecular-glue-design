@@ -2,6 +2,7 @@ import os
 from typing import Iterator, List, Tuple
 
 BASE_DIR = "./data/TernaryDB/pdbs"
+PDBBIND_DIR = "./data/PDBBind/P-P"
 
 
 def iter_complex_dirs(base_dir: str) -> Iterator[str]:
@@ -9,6 +10,106 @@ def iter_complex_dirs(base_dir: str) -> Iterator[str]:
         complex_dir = os.path.join(base_dir, entry)
         if os.path.isdir(complex_dir):
             yield complex_dir
+
+
+def iter_pdbbind_files(base_dir: str) -> Iterator[Tuple[str, str]]:
+    """Iterate over PDBBind complex files, yielding (file_path, complex_name)."""
+    for entry in sorted(os.listdir(base_dir)):
+        if entry.endswith('_complex.pdb'):
+            file_path = os.path.join(base_dir, entry)
+            if os.path.isfile(file_path):
+                complex_name = entry.replace('_complex.pdb', '')
+                yield file_path, complex_name
+
+
+def read_pdbbind_complex(file_path: str) -> List[str]:
+    """Read a PDBBind complex file."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Complex file not found: {file_path}")
+    with open(file_path, "r") as f:
+        return f.readlines()
+
+
+def find_ter_index(lines: List[str]) -> int:
+    """Find the index of the first TER record; return -1 if not found."""
+    for i, line in enumerate(lines):
+        if line.startswith("TER"):
+            return i
+    return -1
+
+
+def split_pdbbind_complex(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Split complex into protein1 (before TER) and protein2 (after TER)."""
+    ter_idx = find_ter_index(lines)
+    
+    # protein1: ATOM records before TER
+    prot1_raw: List[str] = []
+    for i, line in enumerate(lines):
+        if ter_idx != -1 and i >= ter_idx:
+            break
+        if line.startswith("ATOM"):
+            prot1_raw.append(line)
+    
+    # protein2: ATOM records after TER
+    prot2_raw: List[str] = []
+    if ter_idx != -1:
+        for i in range(ter_idx + 1, len(lines)):
+            line = lines[i]
+            if line.startswith("ATOM"):
+                prot2_raw.append(line)
+    
+    return prot1_raw, prot2_raw
+
+
+def process_pdbbind_complex(file_path: str, output_dir: str) -> None:
+    """Process a single PDBBind complex file."""
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Read complex file
+    lines = read_pdbbind_complex(file_path)
+    
+    # Split into proteins
+    prot1_raw, prot2_raw = split_pdbbind_complex(lines)
+    
+    # Renumber atom serials
+    prot1 = renumber_serials(prot1_raw)
+    prot2 = renumber_serials(prot2_raw)
+    
+    # Write output files
+    with open(os.path.join(output_dir, "protein1.pdb"), "w") as f:
+        f.writelines(prot1)
+    with open(os.path.join(output_dir, "protein2.pdb"), "w") as f:
+        f.writelines(prot2)
+    
+    # Move the original complex file to the output directory
+    import shutil
+    complex_filename = os.path.basename(file_path)
+    dest_path = os.path.join(output_dir, complex_filename)
+    shutil.move(file_path, dest_path)
+
+
+def process_pdbbind_dataset() -> None:
+    """Process all PDBBind complex files."""
+    processed = 0
+    failures = 0
+    
+    # Get all complex files before processing (since they will be moved)
+    complex_files = list(iter_pdbbind_files(PDBBIND_DIR))
+    
+    for file_path, complex_name in complex_files:
+        try:
+            # Create output directory for this complex
+            output_dir = os.path.join(PDBBIND_DIR, complex_name)
+            process_pdbbind_complex(file_path, output_dir)
+            processed += 1
+            print(f"OK: {complex_name}")
+        except Exception as e:
+            print(f"FAIL: {complex_name} ({e})")
+            failures += 1
+    
+    print(f"PDBBind processing done. processed={processed}, failures={failures}")
+
 
 def read_gt_complex(complex_dir: str) -> List[str]:
     gt_path = os.path.join(complex_dir, "gt_complex.pdb")
@@ -98,18 +199,25 @@ def split_and_write(complex_dir: str, lines: List[str]) -> None:
         f.writelines(prot2)
 
 def main() -> None:
-    processed = 0
-    failures = 0
-    for complex_dir in iter_complex_dirs(BASE_DIR):
-        try:
-            lines = read_gt_complex(complex_dir)
-            split_and_write(complex_dir, lines)
-            processed += 1
-            print(f"OK: {complex_dir}")
-        except Exception as e:
-            print(f"FAIL: {complex_dir} ({e})")
-            failures += 1
-    print(f"Done. processed={processed}, failures={failures}")
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "pdbbind":
+        # Process PDBBind dataset
+        process_pdbbind_dataset()
+    else:
+        # Process TernaryDB dataset (default)
+        processed = 0
+        failures = 0
+        for complex_dir in iter_complex_dirs(BASE_DIR):
+            try:
+                lines = read_gt_complex(complex_dir)
+                split_and_write(complex_dir, lines)
+                processed += 1
+                print(f"OK: {complex_dir}")
+            except Exception as e:
+                print(f"FAIL: {complex_dir} ({e})")
+                failures += 1
+        print(f"TernaryDB processing done. processed={processed}, failures={failures}")
 
 if __name__ == "__main__":
     main()

@@ -130,6 +130,13 @@ def _build_data_dict_for_complex_dir(complex_dir):
     p2lig_lig_pocket_coords_origin, p2lig_lig_pocket_mask, p2lig_p2_pocket_mask = get_pocket_and_mask(
         lig_coords_gt, p2_graph.ndata['x'], cutoff=ds_cfg.pocket_cutoff
     )
+    # p1p2 pocket
+    p1p2_p1_pocket_coords, p1p2_p1_pocket_mask, p1p2_p2_pocket_mask = get_pocket_and_mask(
+        p1_graph.ndata['x'], p2_graph.ndata['x'], cutoff=ds_cfg.pocket_cutoff
+    )
+    p2p1_p1_pocket_coords, p2p1_p1_pocket_mask, p2p1_p2_pocket_mask = get_pocket_and_mask(
+        p2_graph.ndata['x'], p1_graph.ndata['x'], cutoff=ds_cfg.pocket_cutoff
+    )
     assert torch.allclose(p1lig_lig_pocket_coords, lig_coords_gt[p1lig_lig_pocket_mask])
 
     p1lig_lig_pocket_coords = lig_coords_gt[p1lig_lig_pocket_mask]
@@ -150,6 +157,11 @@ def _build_data_dict_for_complex_dir(complex_dir):
         p2lig_p2_pocket_coords=[p2lig_lig_pocket_coords_origin],
         p2lig_lig_pocket_mask=[p2lig_lig_pocket_mask],
         p2lig_lig_pocket_coords=[p2lig_lig_pocket_coords_origin],
+        # p1p2 pocket
+        # p1p2_p1_pocket_mask=[p1p2_p1_pocket_mask],
+        # p1p2_p1_pocket_coords=[p1p2_p1_pocket_coords],
+        # p2p1_p1_pocket_mask=[p2p1_p1_pocket_mask],
+        # p2p1_p1_pocket_coords=[p2p1_p1_pocket_coords],
     )
 
     return data
@@ -181,7 +193,17 @@ def build_all_data_dicts_from_ternarydb(base_dir: str = "./data/TernaryDB/pdbs")
 
 
 if __name__ == '__main__':
-    base_dir = "./data/TernaryDB/pdbs"
-    dataset = build_all_data_dicts_from_ternarydb(base_dir)
-    print(dataset[0:2])
-    print(f"Built dataset for {len(dataset)} complexes under {base_dir}")
+    # Example:
+    complex_dir = "./data/TernaryDB/pdbs/1A2Y_A_C_PO4"
+    data = _build_data_dict_for_complex_dir(complex_dir)
+    print(data)
+
+    print("#" * 100)
+    print(data['rec_graph'].ndata['x'])
+    print(data['rec_graph'].ndata['feat'])
+
+    # Generate dataset.
+    # base_dir = "./data/TernaryDB/pdbs"
+    # dataset = build_all_data_dicts_from_ternarydb(base_dir)
+    # print(dataset[0:2])
+    # print(f"Built dataset for {len(dataset)} complexes under {base_dir}")
