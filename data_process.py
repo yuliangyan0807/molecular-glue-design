@@ -1,5 +1,6 @@
 import os
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Tuple, Dict
+from Bio import PDB
 
 BASE_DIR = "./data/TernaryDB/pdbs"
 PDBBIND_DIR = "./data/PDBBind/P-P"
@@ -198,12 +199,170 @@ def split_and_write(complex_dir: str, lines: List[str]) -> None:
     with open(os.path.join(complex_dir, "protein2.pdb"), "w") as f:
         f.writelines(prot2)
 
+def parse_seqres_and_ssbond(file_path: str) -> Tuple[Dict[str, List[str]], List[Tuple[str, str]]]:
+    """Parse SEQRES and SSBOND records from PDB file."""
+    seqres_data = {}  # chain_id -> sequence
+    ssbond_pairs = []  # list of (chain1, chain2) pairs
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            if line.startswith('SEQRES'):
+                # SEQRES format: SEQRES serial chain_id num_residues residues...
+                parts = line.split()
+                if len(parts) >= 4:
+                    chain_id = parts[2]
+                    residues = parts[4:]
+                    if chain_id not in seqres_data:
+                        seqres_data[chain_id] = []
+                    seqres_data[chain_id].extend(residues)
+            
+            elif line.startswith('SSBOND'):
+                # SSBOND format: SSBOND serial CYS chain1 res1 CYS chain2 res2 ...
+                parts = line.split()
+                if len(parts) >= 6:
+                    chain1 = parts[3]
+                    chain2 = parts[6]
+                    if chain1 != chain2:  # Only inter-chain bonds
+                        ssbond_pairs.append((chain1, chain2))
+    
+    return seqres_data, ssbond_pairs
+
+def group_chains_by_sequence_and_bonds(seqres_data: Dict[str, List[str]], 
+                                     ssbond_pairs: List[Tuple[str, str]]) -> Tuple[List[str], List[str]]:
+    """Group chains into protein1 and protein2 based on sequence similarity and SSBOND connections."""
+    if not seqres_data:
+        return [], []
+    
+    # Convert sequences to strings for comparison
+    chain_sequences = {chain: ' '.join(seq) for chain, seq in seqres_data.items()}
+    
+    # Find unique sequences and their lengths
+    unique_sequences = {}
+    for chain, seq in chain_sequences.items():
+        if seq not in unique_sequences:
+            unique_sequences[seq] = []
+        unique_sequences[seq].append(chain)
+    
+    # Strategy 1: If we have exactly 2 unique sequences, use them
+    if len(unique_sequences) == 2:
+        seq_list = list(unique_sequences.values())
+        # Put the longer sequence as protein1, shorter as protein2
+        if len(seq_list[0][0]) > len(seq_list[1][0]):
+            protein1_chains = seq_list[0]
+            protein2_chains = seq_list[1]
+        else:
+            protein1_chains = seq_list[1]
+            protein2_chains = seq_list[0]
+    
+    # Strategy 2: If we have more than 2 unique sequences, use a more sophisticated approach
+    else:
+        # Sort chains by sequence length (descending)
+        chains_by_length = sorted(chain_sequences.keys(), 
+                                key=lambda x: len(chain_sequences[x]), reverse=True)
+        
+        # Start with the longest chain as protein1
+        protein1_chains = [chains_by_length[0]]
+        protein2_chains = []
+        
+        # Use SSBOND connections to determine grouping
+        for chain1, chain2 in ssbond_pairs:
+            if chain1 in protein1_chains and chain2 not in protein1_chains and chain2 not in protein2_chains:
+                protein2_chains.append(chain2)
+            elif chain2 in protein1_chains and chain1 not in protein1_chains and chain1 not in protein2_chains:
+                protein2_chains.append(chain1)
+        
+        # Group remaining chains based on sequence similarity
+        for chain in chains_by_length[1:]:
+            if chain not in protein1_chains and chain not in protein2_chains:
+                # Check if this chain has similar sequence to protein1
+                if chain_sequences[chain] == chain_sequences[protein1_chains[0]]:
+                    protein1_chains.append(chain)
+                else:
+                    # If no protein2 chains yet, or if this chain is similar to existing protein2 chains
+                    if not protein2_chains or any(chain_sequences[chain] == chain_sequences[p2] for p2 in protein2_chains):
+                        protein2_chains.append(chain)
+                    else:
+                        # If this is a new sequence type, add to protein2 (assuming it's part of the second protein)
+                        protein2_chains.append(chain)
+    
+    return protein1_chains, protein2_chains
+
+def process_pdbbind():
+    """Process PDBBind complex files using Bio.PDB to split by chains based on SEQRES and SSBOND."""
+    parser = PDB.PDBParser(QUIET=True)
+    pdbio = PDB.PDBIO()
+    processed = 0
+    failures = 0
+    
+    for complex_dir in iter_complex_dirs(PDBBIND_DIR):
+        try:
+            complex_name = os.path.basename(complex_dir)
+            complex_file = os.path.join(complex_dir, f"{complex_name}_complex.pdb")
+            
+            if not os.path.exists(complex_file):
+                print(f"SKIP: {complex_name} (complex file not found)")
+                continue
+            
+            # Parse SEQRES and SSBOND information
+            seqres_data, ssbond_pairs = parse_seqres_and_ssbond(complex_file)
+            
+            if not seqres_data:
+                print(f"SKIP: {complex_name} (no SEQRES data found)")
+                continue
+            
+            # Group chains based on sequence and bonds
+            protein1_chains, protein2_chains = group_chains_by_sequence_and_bonds(seqres_data, ssbond_pairs)
+            
+            if not protein1_chains or not protein2_chains:
+                print(f"SKIP: {complex_name} (could not determine protein groups)")
+                continue
+            
+            # Parse the complex structure
+            structure = parser.get_structure(complex_name, complex_file)
+            model = structure[0]
+            
+            # Create output directory
+            os.makedirs(complex_dir, exist_ok=True)
+            
+            # Write protein1.pdb
+            protein1_structure = PDB.Structure.Structure(f"{complex_name}_protein1")
+            protein1_model = PDB.Model.Model(0)
+            for chain_id in protein1_chains:
+                if chain_id in model:
+                    protein1_model.add(model[chain_id])
+            protein1_structure.add(protein1_model)
+            
+            with open(os.path.join(complex_dir, "protein1.pdb"), "w") as f:
+                pdbio.set_structure(protein1_structure)
+                pdbio.save(f)
+            
+            # Write protein2.pdb
+            protein2_structure = PDB.Structure.Structure(f"{complex_name}_protein2")
+            protein2_model = PDB.Model.Model(0)
+            for chain_id in protein2_chains:
+                if chain_id in model:
+                    protein2_model.add(model[chain_id])
+            protein2_structure.add(protein2_model)
+            
+            with open(os.path.join(complex_dir, "protein2.pdb"), "w") as f:
+                pdbio.set_structure(protein2_structure)
+                pdbio.save(f)
+            
+            processed += 1
+            print(f"OK: {complex_name} (protein1: {protein1_chains}, protein2: {protein2_chains})")
+            
+        except Exception as e:
+            print(f"FAIL: {complex_name} ({e})")
+            failures += 1
+    
+    print(f"PDBBind processing done. processed={processed}, failures={failures}")
+
 def main() -> None:
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "pdbbind":
         # Process PDBBind dataset
-        process_pdbbind_dataset()
+        process_pdbbind()
     else:
         # Process TernaryDB dataset (default)
         processed = 0
