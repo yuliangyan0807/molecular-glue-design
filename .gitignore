@@ -2,3 +2,4 @@ DeepTernary/
 data/
 logs/
 *.tmp
+pocket_results/
