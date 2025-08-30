@@ -194,7 +194,7 @@ def build_all_data_dicts_from_ternarydb(base_dir: str = "./data/TernaryDB/pdbs")
 
 if __name__ == '__main__':
     # Example:
-    complex_dir = "./data/TernaryDB/pdbs/1A2Y_A_C_PO4"
+    complex_dir = "./data/TernaryDB/MGD_Train/1A2Y_A_C_PO4"
     data = _build_data_dict_for_complex_dir(complex_dir)
     print(data)
 
