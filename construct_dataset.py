@@ -93,6 +93,9 @@ def construct_interface_modeling_dataset(
         # Decide randomly whether to move p1 or p2 (50% chance each)
         move_p1 = random.random() < 0.5
 
+        # Anchor.
+        # TODO
+
         if move_p1:
             # random move p1
             protein1_rot_T, protein1_rot_b = random_rotation_translation(translation_distance=5)
@@ -111,6 +114,7 @@ def construct_interface_modeling_dataset(
         p2_coords = p2_graph.ndata['x']
         
         data = {
+            'name': name,
             'p1_residue': p1_residue,
             'p2_residue': p2_residue,
             'p1_coords': p1_coords,
@@ -132,6 +136,7 @@ def construct_interface_modeling_dataset(
     return dataset
 
 if __name__ == "__main__":
+    # Construct interface modeling dataset.
     dataset =construct_interface_modeling_dataset(
         data_dir="./data/TernaryDB/MGD_Train"
     )
