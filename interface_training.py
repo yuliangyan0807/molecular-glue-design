@@ -1,10 +1,8 @@
 import os
 import argparse
-import time
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -66,51 +64,61 @@ def collate_fn(batch):
         'sigma': sigma
     }
 
-def ellipsoid_loss(pred_params, batch, use_kl=False):
+def ellipsoid_loss(pred_params, batch, use_kl=False, mu_scale=1.0, sigma_scale=1.0, eps=1e-6):
     """
-    pred_params: (B, 12) tensor from model
-        - first 3 values: mu
-        - next 9 values: sigma (flattened 3x3 matrix)
-    batch: dict, contains 'mu' (B, 3) and 'sigma' (B, 3, 3)
-    use_kl: whether to use KL divergence (default True), else Frobenius norm
-    """
+    Ellipsoid loss with fixed per-quantity scaling (stateless).
+    - mu is scaled by mu_scale (divide before computing loss).
+    - sigma is scaled by sigma_scale (divide before computing loss).
+    No batch statistics; use fixed constants from config/hyperparams.
 
+    Args:
+        pred_params: (B, 12) [mu(3), sigma(9)]
+        batch: dict with 'mu': (B, 3), 'sigma': (B, 3, 3)
+        use_kl: if True, use Gaussian KL for sigma; else Frobenius MSE
+        mu_scale: scalar to scale mu terms (divide in loss)
+        sigma_scale: scalar to scale sigma terms (divide in loss)
+        eps: numerical jitter for PD stability
+    """
     B = pred_params.shape[0]
 
-    # Split prediction
-    mu_pred = pred_params[:, :3]                         # (B, 3)
-    sigma_pred = pred_params[:, 3:].reshape(B, 3, 3)     # (B, 3, 3)
+    # Split predictions
+    mu_pred = pred_params[:, :3]   # (B, 3)
+    sigma_pred = pred_params[:, 3:].reshape(B, 3, 3) # (B, 3, 3)
 
-    mu_true = batch['mu']                                # (B, 3)
-    sigma_true = batch['sigma']                          # (B, 3, 3)
+    mu_true = batch["mu"]  # (B, 3)
+    sigma_true = batch["sigma"]  # (B, 3, 3)
 
-    # Symmetrize sigma_pred (to avoid non-symmetric cases)
+    # Symmetrize and stabilize covariances
     sigma_pred = 0.5 * (sigma_pred + sigma_pred.transpose(-1, -2))
+    sigma_true = 0.5 * (sigma_true + sigma_true.transpose(-1, -2))
 
-    # mu loss
-    mu_loss = F.mse_loss(mu_pred, mu_true)
+    # Scale-normalize before computing losses
+    mu_pred_n = mu_pred
+    mu_true_n = mu_true / mu_scale
 
-    # sigma loss
+    sigma_pred_n = sigma_pred
+    sigma_true_n = sigma_true / sigma_scale
+
+    # Mean loss (MSE in normalized space)
+    mu_loss = F.mse_loss(mu_pred_n, mu_true_n)
+
+    # Sigma loss (normalized space)
     if use_kl:
-        # KL divergence between Gaussians
-        k = mu_pred.shape[1]  # 3
-        sigma_true_inv = torch.inverse(sigma_true)
-        diff = (mu_true - mu_pred).unsqueeze(-1)  # (B, 3, 1)
+        # KL between Gaussians, covariance-only part (mean error already covered above)
+        I = torch.eye(3, device=sigma_true.device, dtype=sigma_true.dtype)
+        sigma_pred_n = sigma_pred_n + eps * I
+        sigma_true_n = sigma_true_n + eps * I
 
-        trace_term = torch.einsum('bij,bjk->bik', sigma_true_inv, sigma_pred).diagonal(dim1=-2, dim2=-1).sum(-1)
-        mahalanobis = torch.einsum('bji,bij->b', diff, torch.einsum('bij,bjk->bik', sigma_true_inv, diff))
-        logdet_term = torch.logdet(sigma_true + 1e-6*torch.eye(3, device=sigma_true.device)) \
-                      - torch.logdet(sigma_pred + 1e-6*torch.eye(3, device=sigma_pred.device))
-
-        kl = 0.5 * (trace_term + mahalanobis - k + logdet_term)
-        sigma_loss = kl.mean()
+        k = mu_pred_n.shape[1]  # 3
+        sigma_true_inv = torch.linalg.inv(sigma_true_n)
+        trace_term = torch.einsum("bij,bjk->bik", sigma_true_inv, sigma_pred_n).diagonal(dim1=-2, dim2=-1).sum(-1)
+        logdet_term = torch.logdet(sigma_true_n) - torch.logdet(sigma_pred_n)
+        cov_kl = 0.5 * (trace_term - k + logdet_term)
+        sigma_loss = cov_kl.mean()
     else:
-        # Frobenius norm
-        sigma_loss = F.mse_loss(sigma_pred, sigma_true)
+        sigma_loss = F.mse_loss(sigma_pred_n, sigma_true_n)
 
-    # Final loss
-    loss = mu_loss + sigma_loss
-    return loss
+    return mu_loss + sigma_loss
 
 
 def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, args):
@@ -146,8 +154,14 @@ def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, arg
         # print(outputs['joint_representation'].shape)
         # print(outputs['ellipsoid_params'].shape)
 
-        # Compute losses using the ellipsoid loss function
-        loss = ellipsoid_loss(outputs['ellipsoid_params'], batch)
+        # Compute losses using the ellipsoid loss function (apply fixed scaling)
+        loss = ellipsoid_loss(
+            outputs['ellipsoid_params'],
+            batch,
+            use_kl=args.use_kl,
+            mu_scale=args.mu_scale,
+            sigma_scale=args.sigma_scale
+        )
 
         # Backward pass
         optimizer.zero_grad()
@@ -170,7 +184,7 @@ def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, arg
         'loss': total_loss / num_batches,
     }
 
-def print_sample_predictions(model, dataloader, device, num_samples=3):
+def print_sample_predictions(model, dataloader, device, args, num_samples=3):
     """Randomly select samples and print model predictions vs ground truth ellipsoid parameters"""
     model.eval()
     
@@ -188,12 +202,13 @@ def print_sample_predictions(model, dataloader, device, num_samples=3):
         )
         
         pred_params = outputs['ellipsoid_params']  # (batch_size, 12)
-        mu_pred = pred_params[:, :3]               # (batch_size, 3) - predicted center
-        sigma_pred = pred_params[:, 3:].reshape(-1, 3, 3)  # (batch_size, 3, 3) - predicted covariance
+        # Denormalize predictions to original units for display
+        mu_pred = pred_params[:, :3] * args.mu_scale         # (batch_size, 3)
+        sigma_pred = pred_params[:, 3:].reshape(-1, 3, 3) * args.sigma_scale  # (batch_size, 3, 3)
         
         # Ground truth values
-        mu_true = batch['mu']                      # (batch_size, 3) - true center
-        sigma_true = batch['sigma']                # (batch_size, 3, 3) - true covariance
+        mu_true = batch['mu']  # (batch_size, 3) - true center
+        sigma_true = batch['sigma'] # (batch_size, 3, 3) - true covariance
         
         # Randomly select samples from the batch
         batch_size = pred_params.shape[0]
@@ -306,7 +321,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics, args):
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
     """Load model checkpoint."""
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')  # 先加载到CPU
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
         model_state_dict = checkpoint['model_state_dict']
         
@@ -365,6 +380,13 @@ def main():
     # Other
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--debug', action='store_true', help='Debug mode')
+
+    # Fixed scaling for ellipsoid loss and prediction
+    parser.add_argument('--mu_scale', type=float, default=64.0, help='Fixed scale for mu (center) used in loss and denormalization')
+    parser.add_argument('--sigma_scale', type=float, default=128.0, help='Fixed scale for sigma (covariance) used in loss and denormalization')
+
+    # Loss options
+    parser.add_argument('--use_kl', action='store_true', default=False, help='Use KL divergence for sigma term (default: False). If not set, use Frobenius MSE')
     
     args = parser.parse_args()
     
@@ -458,7 +480,7 @@ def main():
             print(f"Epoch {epoch}: {train_metrics}")
             
             # Print sample predictions to monitor training progress
-            print_sample_predictions(model, train_loader, device, num_samples=3)
+            print_sample_predictions(model, train_loader, device, args, num_samples=3)
         
         # Save checkpoint periodically
         if epoch % args.save_freq == 0:
@@ -477,5 +499,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

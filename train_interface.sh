@@ -7,8 +7,8 @@ DATASET_DIR=${DATASET_DIR:-"./interface_modeling_dataset"}
 LOG_DIR=${LOG_DIR:-"./logs"}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"./checkpoints"}
 BATCH_SIZE=${BATCH_SIZE:-8}
-LR=${LR:-1e-4}
-EPOCHS=${EPOCHS:-500}
+LR=${LR:-5e-4}
+EPOCHS=${EPOCHS:-700}
 PROJECT=${PROJECT:-"interface_model"}
 NAME=${NAME:-"interface_model_$(date +%Y%m%d-%H%M%S)"}
 
