@@ -85,16 +85,12 @@ def construct_interface_modeling_dataset(
 
         
         # Store original interface coordinates before any transformations
-        interface_coords_gt = deepcopy(interface_coords)
+        interface_coords_original = deepcopy(interface_coords)
+        # Flag if only one side has interface (based on original detection)
+        single_sided = (len(p1_interface_residues) == 0) != (len(p2_interface_residues) == 0)
 
-        # Get ellipsoid parameters for interface
-        mu, sigma = get_elilipsoid_for_interface(interface_coords)
-        
         # Decide randomly whether to move p1 or p2 (50% chance each)
         move_p1 = random.random() < 0.5
-
-        # Anchor.
-        # TODO
 
         if move_p1:
             # random move p1
@@ -112,6 +108,18 @@ def construct_interface_modeling_dataset(
         # Get the protein1 and protein2's C-alpha coordinates.
         p1_coords = p1_graph.ndata['x']
         p2_coords = p2_graph.ndata['x']
+
+        # Build separate interfaces for p1 and p2 (moved protein's interface moves accordingly)
+        p1_interface_coords = p1_coords[p1_interface_mask]
+        p2_interface_coords = p2_coords[p2_interface_mask]
+
+        # Fallback: make both sides non-empty if possible
+        p1_interface_coords = p1_interface_coords if len(p1_interface_coords) > 0 else p2_interface_coords
+        p2_interface_coords = p2_interface_coords if len(p2_interface_coords) > 0 else p1_interface_coords
+
+        # Compute per-interface ellipsoids
+        i1_mu, i1_sigma = get_elilipsoid_for_interface(p1_interface_coords)
+        i2_mu, i2_sigma = get_elilipsoid_for_interface(p2_interface_coords)
         
         data = {
             'name': name,
@@ -119,13 +127,18 @@ def construct_interface_modeling_dataset(
             'p2_residue': p2_residue,
             'p1_coords': p1_coords,
             'p2_coords': p2_coords,
-            'interface_coords': interface_coords,
-            'mu': mu,
-            'sigma': sigma,
+            'interface_coords_original': interface_coords_original,
+            'p1_interface_coords': p1_interface_coords,
+            'i1_mu': i1_mu,
+            'i1_sigma': i1_sigma,
+            'p2_interface_coords': p2_interface_coords,
+            'i2_mu': i2_mu,
+            'i2_sigma': i2_sigma,
             'p1_interface_mask': p1_interface_mask,
             'p2_interface_mask': p2_interface_mask,
             'p1_interface_residues': p1_interface_residues,
             'p2_interface_residues': p2_interface_residues,
+            'single_sided': single_sided,
         }
         # print(data)
     
@@ -140,8 +153,8 @@ if __name__ == "__main__":
     dataset =construct_interface_modeling_dataset(
         data_dir="./data/TernaryDB/MGD_Train"
     )
-    dataset = dataset.save_to_disk("interface_modeling_dataset")
+    dataset = dataset.save_to_disk("interface_modeling_dataset_v2")
 
-    dataset = load_from_disk("interface_modeling_dataset")
+    dataset = load_from_disk("interface_modeling_dataset_v2")
     print(dataset)
     print(len(dataset))
