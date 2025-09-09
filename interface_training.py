@@ -50,8 +50,11 @@ def collate_fn(batch):
     p1_coords, _ = pad_and_stack(p1_coords, pad_value=0.0)
     p2_coords, _ = pad_and_stack(p2_coords, pad_value=0.0)
 
-    mu = torch.stack([torch.tensor(sample['mu'], dtype=torch.float32) for sample in batch], dim=0)  # (batch_size, 3)
-    sigma = torch.stack([torch.tensor(sample['sigma'], dtype=torch.float32) for sample in batch], dim=0)  # (batch_size, 3, 3) or (batch_size, 9)
+    # Interface parameters for p1 and p2
+    i1_mu = torch.stack([torch.tensor(sample['i1_mu'], dtype=torch.float32) for sample in batch], dim=0)
+    i1_sigma = torch.stack([torch.tensor(sample['i1_sigma'], dtype=torch.float32) for sample in batch], dim=0)
+    i2_mu = torch.stack([torch.tensor(sample['i2_mu'], dtype=torch.float32) for sample in batch], dim=0)
+    i2_sigma = torch.stack([torch.tensor(sample['i2_sigma'], dtype=torch.float32) for sample in batch], dim=0)
 
     return {
         'p1_residue': p1_residue,
@@ -60,68 +63,86 @@ def collate_fn(batch):
         'p2_coords': p2_coords,
         'p1_mask': p1_mask,
         'p2_mask': p2_mask,
-        'mu': mu,
-        'sigma': sigma
+        'i1_mu': i1_mu,
+        'i1_sigma': i1_sigma,
+        'i2_mu': i2_mu,
+        'i2_sigma': i2_sigma,
     }
 
-def ellipsoid_loss(pred_params, batch, use_kl=False, mu_scale=1.0, sigma_scale=1.0, eps=1e-6):
+def ellipsoid_loss(pred_i1, pred_i2, batch, use_kl=False, mu_scale=1.0, sigma_scale=1.0, eps=1e-6):
     """
-    Ellipsoid loss with fixed per-quantity scaling (stateless).
-    - mu is scaled by mu_scale (divide before computing loss).
-    - sigma is scaled by sigma_scale (divide before computing loss).
-    No batch statistics; use fixed constants from config/hyperparams.
-
-    Args:
-        pred_params: (B, 12) [mu(3), sigma(9)]
-        batch: dict with 'mu': (B, 3), 'sigma': (B, 3, 3)
-        use_kl: if True, use Gaussian KL for sigma; else Frobenius MSE
-        mu_scale: scalar to scale mu terms (divide in loss)
-        sigma_scale: scalar to scale sigma terms (divide in loss)
-        eps: numerical jitter for PD stability
+    Ellipsoid loss for two interfaces (p1 and p2). Each pred is (B, 12) [mu(3), sigma(9)].
+    Targets are in batch: 'i1_mu', 'i1_sigma', 'i2_mu', 'i2_sigma'.
     """
-    B = pred_params.shape[0]
+    def single_loss(pred_params, mu_true, sigma_true):
+        B = pred_params.shape[0]
+        mu_pred = pred_params[:, :3]
+        sigma_pred = pred_params[:, 3:].reshape(B, 3, 3)
 
-    # Split predictions
-    mu_pred = pred_params[:, :3]   # (B, 3)
-    sigma_pred = pred_params[:, 3:].reshape(B, 3, 3) # (B, 3, 3)
+        # Symmetrize
+        sigma_pred = 0.5 * (sigma_pred + sigma_pred.transpose(-1, -2))
+        sigma_true = 0.5 * (sigma_true + sigma_true.transpose(-1, -2))
 
-    mu_true = batch["mu"]  # (B, 3)
-    sigma_true = batch["sigma"]  # (B, 3, 3)
+        # Scale-normalize
+        mu_true_n = mu_true / mu_scale
+        sigma_true_n = sigma_true / sigma_scale
 
-    # Symmetrize and stabilize covariances
-    sigma_pred = 0.5 * (sigma_pred + sigma_pred.transpose(-1, -2))
-    sigma_true = 0.5 * (sigma_true + sigma_true.transpose(-1, -2))
+        mu_loss = F.mse_loss(mu_pred, mu_true_n)
 
-    # Scale-normalize before computing losses
-    mu_pred_n = mu_pred
-    mu_true_n = mu_true / mu_scale
+        if use_kl:
+            I = torch.eye(3, device=sigma_true_n.device, dtype=sigma_true_n.dtype)
+            sigma_pred_n = sigma_pred + eps * I
+            sigma_true_n = sigma_true_n + eps * I
+            k = mu_pred.shape[1]
+            sigma_true_inv = torch.linalg.inv(sigma_true_n)
+            trace_term = torch.einsum("bij,bjk->bik", sigma_true_inv, sigma_pred_n).diagonal(dim1=-2, dim2=-1).sum(-1)
+            logdet_term = torch.logdet(sigma_true_n) - torch.logdet(sigma_pred_n)
+            cov_kl = 0.5 * (trace_term - k + logdet_term)
+            sigma_loss = cov_kl.mean()
+        else:
+            sigma_loss = F.mse_loss(sigma_pred, sigma_true_n)
 
-    sigma_pred_n = sigma_pred
-    sigma_true_n = sigma_true / sigma_scale
+        return mu_loss + sigma_loss
 
-    # Mean loss (MSE in normalized space)
-    mu_loss = F.mse_loss(mu_pred_n, mu_true_n)
-
-    # Sigma loss (normalized space)
-    if use_kl:
-        # KL between Gaussians, covariance-only part (mean error already covered above)
-        I = torch.eye(3, device=sigma_true.device, dtype=sigma_true.dtype)
-        sigma_pred_n = sigma_pred_n + eps * I
-        sigma_true_n = sigma_true_n + eps * I
-
-        k = mu_pred_n.shape[1]  # 3
-        sigma_true_inv = torch.linalg.inv(sigma_true_n)
-        trace_term = torch.einsum("bij,bjk->bik", sigma_true_inv, sigma_pred_n).diagonal(dim1=-2, dim2=-1).sum(-1)
-        logdet_term = torch.logdet(sigma_true_n) - torch.logdet(sigma_pred_n)
-        cov_kl = 0.5 * (trace_term - k + logdet_term)
-        sigma_loss = cov_kl.mean()
-    else:
-        sigma_loss = F.mse_loss(sigma_pred_n, sigma_true_n)
-
-    return mu_loss + sigma_loss
+    loss1 = single_loss(pred_i1, batch['i1_mu'], batch['i1_sigma'])
+    loss2 = single_loss(pred_i2, batch['i2_mu'], batch['i2_sigma'])
+    return 0.5 * (loss1 + loss2)
 
 
-def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, args):
+def count_parameters(model: torch.nn.Module):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def log_model_summary(model: torch.nn.Module, args):
+    if args.local_rank != 0:
+        return
+    os.makedirs(args.log_dir, exist_ok=True)
+    model_to_print = model.module if hasattr(model, 'module') else model
+    total, trainable = count_parameters(model_to_print)
+    summary_lines = []
+    summary_lines.append("Model Architecture:\n")
+    summary_lines.append(str(model_to_print))
+    summary_lines.append("\n\nParameter Counts:")
+    summary_lines.append(f"  Total:     {total:,}")
+    summary_lines.append(f"  Trainable: {trainable:,}")
+    summary_text = "\n".join(summary_lines)
+
+    # Print to console
+    print(summary_text)
+
+    # Log to wandb if enabled
+    try:
+        if not args.debug and wandb.run is not None:
+            wandb.run.summary['model_total_params'] = int(total)
+            wandb.run.summary['model_trainable_params'] = int(trainable)
+            wandb.run.log({'model/architecture': wandb.Html(f"<pre>{summary_text}</pre>")})
+    except Exception as e:
+        print(f"Failed to log model summary to wandb: {e}")
+
+
+def train_epoch(model, dataloader, optimizer, loss_fn, device, epoch, args):
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
@@ -141,22 +162,10 @@ def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, arg
             p1_mask=batch['p1_mask'], p2_mask=batch['p2_mask']
         )
 
-        # print(batch['p1_coords'].shape)
-        # print(batch['p2_coords'].shape)
-        # print(batch['p1_mask'].shape)
-        # print(batch['p2_mask'].shape)
-        # print(batch['p1_mask'])
-        # print(batch['p2_mask'])
-        # print(batch['p1_residue'].shape)
-        # print(batch['p2_residue'].shape)
-        # print(outputs['p1_feats'].shape)
-        # print(outputs['p2_feats'].shape)
-        # print(outputs['joint_representation'].shape)
-        # print(outputs['ellipsoid_params'].shape)
-
         # Compute losses using the ellipsoid loss function (apply fixed scaling)
-        loss = ellipsoid_loss(
-            outputs['ellipsoid_params'],
+        loss = loss_fn(
+            outputs['i1_params'],
+            outputs['i2_params'],
             batch,
             use_kl=args.use_kl,
             mu_scale=args.mu_scale,
@@ -185,77 +194,68 @@ def train_epoch(model, dataloader, optimizer, ellipsoid_loss, device, epoch, arg
     }
 
 def print_sample_predictions(model, dataloader, device, args, num_samples=3):
-    """Randomly select samples and print model predictions vs ground truth ellipsoid parameters"""
+    """Randomly select samples and print model predictions vs ground truth ellipsoid parameters for both interfaces"""
     model.eval()
     
-    # Randomly select a batch
     batch = next(iter(dataloader))
     batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v 
              for k, v in batch.items()}
     
     with torch.no_grad():
-        # Model prediction
         outputs = model(
             batch['p1_residue'], batch['p1_coords'],
             batch['p2_residue'], batch['p2_coords'],
             p1_mask=batch['p1_mask'], p2_mask=batch['p2_mask']
         )
         
-        pred_params = outputs['ellipsoid_params']  # (batch_size, 12)
-        # Denormalize predictions to original units for display
-        mu_pred = pred_params[:, :3] * args.mu_scale         # (batch_size, 3)
-        sigma_pred = pred_params[:, 3:].reshape(-1, 3, 3) * args.sigma_scale  # (batch_size, 3, 3)
-        
-        # Ground truth values
-        mu_true = batch['mu']  # (batch_size, 3) - true center
-        sigma_true = batch['sigma'] # (batch_size, 3, 3) - true covariance
-        
+        pred_i1 = outputs['i1_params']
+        pred_i2 = outputs['i2_params']
+
+        # Denormalize predictions
+        i1_mu_pred = pred_i1[:, :3] * args.mu_scale
+        i1_sigma_pred = pred_i1[:, 3:].reshape(-1, 3, 3) * args.sigma_scale
+        i2_mu_pred = pred_i2[:, :3] * args.mu_scale
+        i2_sigma_pred = pred_i2[:, 3:].reshape(-1, 3, 3) * args.sigma_scale
+
+        i1_mu_true = batch['i1_mu']
+        i1_sigma_true = batch['i1_sigma']
+        i2_mu_true = batch['i2_mu']
+        i2_sigma_true = batch['i2_sigma']
+
         # Randomly select samples from the batch
-        batch_size = pred_params.shape[0]
+        batch_size = pred_i1.shape[0]
         sample_indices = torch.randperm(batch_size)[:num_samples]
         
         print(f"\n{'='*60}")
-        print(f"Sample Predictions (Random {num_samples} samples from batch)")
+        print(f"Sample Predictions (Random {num_samples} samples from batch) - Dual Interfaces")
         print(f"{'='*60}")
         
         for i, idx in enumerate(sample_indices):
             print(f"\nSample {i+1} (Batch Index {idx.item()}):")
             print("-" * 40)
-            
-            # Mu (ellipsoid center)
-            print("Mu (Center):")
-            print(f"  True:  [{mu_true[idx, 0]:8.3f}, {mu_true[idx, 1]:8.3f}, {mu_true[idx, 2]:8.3f}]")
-            print(f"  Pred:  [{mu_pred[idx, 0]:8.3f}, {mu_pred[idx, 1]:8.3f}, {mu_pred[idx, 2]:8.3f}]")
-            print(f"  Error: [{abs(mu_true[idx, 0] - mu_pred[idx, 0]):8.3f}, {abs(mu_true[idx, 1] - mu_pred[idx, 1]):8.3f}, {abs(mu_true[idx, 2] - mu_pred[idx, 2]):8.3f}]")
-            
-            # Sigma (covariance matrix)
-            print("\nSigma (Covariance Matrix):")
-            print("  True:")
-            for j in range(3):
-                print(f"    [{sigma_true[idx, j, 0]:8.3f}, {sigma_true[idx, j, 1]:8.3f}, {sigma_true[idx, j, 2]:8.3f}]")
-            
-            print("  Pred:")
-            for j in range(3):
-                print(f"    [{sigma_pred[idx, j, 0]:8.3f}, {sigma_pred[idx, j, 1]:8.3f}, {sigma_pred[idx, j, 2]:8.3f}]")
-            
-            print("  Error:")
-            for j in range(3):
-                print(f"    [{abs(sigma_true[idx, j, 0] - sigma_pred[idx, j, 0]):8.3f}, {abs(sigma_true[idx, j, 1] - sigma_pred[idx, j, 1]):8.3f}, {abs(sigma_true[idx, j, 2] - sigma_pred[idx, j, 2]):8.3f}]")
-            
-            # Calculate some statistics
-            mu_mse = torch.mean((mu_true[idx] - mu_pred[idx]) ** 2).item()
-            sigma_mse = torch.mean((sigma_true[idx] - sigma_pred[idx]) ** 2).item()
-            
-            print(f"\n  MSE - Mu: {mu_mse:.6f}, Sigma: {sigma_mse:.6f}")
-            
-            # Ellipsoid volume (approximate)
-            try:
-                # True ellipsoid volume (sqrt(det(sigma)))
-                true_volume = torch.sqrt(torch.det(sigma_true[idx] + 1e-6 * torch.eye(3, device=device))).item()
-                pred_volume = torch.sqrt(torch.det(sigma_pred[idx] + 1e-6 * torch.eye(3, device=device))).item()
-                print(f"  Volume - True: {true_volume:.3f}, Pred: {pred_volume:.3f}, Error: {abs(true_volume - pred_volume):.3f}")
-            except:
-                print("  Volume calculation failed (singular matrix)")
+
+            def print_block(tag, mu_true, mu_pred, sigma_true, sigma_pred):
+                print(f"{tag} Mu (Center):")
+                print(f"  True:  [{mu_true[idx, 0]:8.3f}, {mu_true[idx, 1]:8.3f}, {mu_true[idx, 2]:8.3f}]")
+                print(f"  Pred:  [{mu_pred[idx, 0]:8.3f}, {mu_pred[idx, 1]:8.3f}, {mu_pred[idx, 2]:8.3f}]")
+                print(f"  Error: [{abs(mu_true[idx, 0] - mu_pred[idx, 0]):8.3f}, {abs(mu_true[idx, 1] - mu_pred[idx, 1]):8.3f}, {abs(mu_true[idx, 2] - mu_pred[idx, 2]):8.3f}]")
+                print(f"\n{tag} Sigma (Covariance Matrix):")
+                print("  True:")
+                for j in range(3):
+                    print(f"    [{sigma_true[idx, j, 0]:8.3f}, {sigma_true[idx, j, 1]:8.3f}, {sigma_true[idx, j, 2]:8.3f}]")
+                print("  Pred:")
+                for j in range(3):
+                    print(f"    [{sigma_pred[idx, j, 0]:8.3f}, {sigma_pred[idx, j, 1]:8.3f}, {sigma_pred[idx, j, 2]:8.3f}]")
+                print("  Error:")
+                for j in range(3):
+                    print(f"    [{abs(sigma_true[idx, j, 0] - sigma_pred[idx, j, 0]):8.3f}, {abs(sigma_true[idx, j, 1] - sigma_pred[idx, j, 1]):8.3f}, {abs(sigma_true[idx, j, 2] - sigma_pred[idx, j, 2]):8.3f}]")
+                mu_mse = torch.mean((mu_true[idx] - mu_pred[idx]) ** 2).item()
+                sigma_mse = torch.mean((sigma_true[idx] - sigma_pred[idx]) ** 2).item()
+                print(f"\n  MSE - Mu: {mu_mse:.6f}, Sigma: {sigma_mse:.6f}")
+
+            print_block("I1", i1_mu_true, i1_mu_pred, i1_sigma_true, i1_sigma_pred)
+            print("")
+            print_block("I2", i2_mu_true, i2_mu_pred, i2_sigma_true, i2_sigma_pred)
         
         print(f"\n{'='*60}")
     
@@ -449,6 +449,9 @@ def main():
         dim=args.model_dim,
         depth=args.model_depth
     ).to(device)
+
+    # Print and save model summary & parameter counts (before wrapping with DDP)
+    log_model_summary(model, args)
     
     if args.world_size > 1:
         model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)

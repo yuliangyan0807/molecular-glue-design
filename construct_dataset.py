@@ -150,10 +150,10 @@ def construct_interface_modeling_dataset(
 
 if __name__ == "__main__":
     # Construct interface modeling dataset.
-    dataset =construct_interface_modeling_dataset(
-        data_dir="./data/TernaryDB/MGD_Train"
-    )
-    dataset = dataset.save_to_disk("interface_modeling_dataset_v2")
+    # dataset =construct_interface_modeling_dataset(
+    #     data_dir="./data/TernaryDB/MGD_Train"
+    # )
+    # dataset = dataset.save_to_disk("interface_modeling_dataset_v2")
 
     dataset = load_from_disk("interface_modeling_dataset_v2")
     print(dataset)
