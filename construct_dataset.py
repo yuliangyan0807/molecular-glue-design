@@ -75,7 +75,7 @@ def read_ligand_pdb(pdb_path, sanitize=True, remove_hs=True, return_symbols=Fals
     # Z = np.array([a.GetAtomicNum() for a in atoms], dtype=np.int32)
     # coords = np.asarray(positions, dtype=np.float32)
     if remove_hs:
-        mol = Chem.RemoveHs(mol)
+        mol = Chem.RemoveHs(mol, sanitize=False)
     conf = mol.GetConformer()
     positions = conf.GetPositions()
     atoms = list(mol.GetAtoms())

@@ -3,6 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.spatial.transform import Rotation
+
+from utils.so3_utils import geodesic_t, uniform_so3
 
 import copy
 import math
@@ -25,7 +28,7 @@ from pepflow.utils.misc import seed_all
 from pepflow.utils.train import sum_weighted_losses
 from torch.nn.utils import clip_grad_norm_
 
-from pepflow.modules.so3.dist import centered_gaussian,uniform_so3
+from pepflow.modules.so3.dist import centered_gaussian
 from pepflow.modules.common.geometry import batch_align, align
 
 from tqdm import tqdm
@@ -56,6 +59,20 @@ resolution_to_num_atoms = {
     'backbone+CB': 5,
     'full': max_num_heavyatoms
 }
+
+# Helper functions
+def clampped_one_hot(x, num_classes):
+    mask = (x >= 0) & (x < num_classes) # (N, L)
+    x = x.clamp(min=0, max=num_classes-1)
+    y = F.one_hot(x, num_classes) * mask[...,None]  # (N, L, C)
+    return y
+
+def sample_from(c):
+    """sample from c"""
+    N,L,K = c.size()
+    c = c.view(N * L, K) + 1e-8
+    x = torch.multinomial(c, 1).view(N, L)
+    return x
 
 class FlowModel(nn.Module):
     def __init__(self,cfg):
@@ -373,6 +390,61 @@ class FlowModel(nn.Module):
                                 'rotmats_1':rotmats_1.cpu(),'trans_1':trans_1_c.cpu(),'angles_1':angles_1.cpu(),'seqs_1':seqs_1.cpu()})
         
         return clean_traj
+
+class TernaryFlowModel(nn.Module):
+    def __init__(self,cfg):
+        super().__init__()
+        self._cfg = cfg
+
+        self._interpolant_cfg = cfg.interpolant
+
+        self.K = self._interpolant_cfg.seqs.num_classes
+        self.k = self._interpolant_cfg.seqs.simplex_value
+    
+    def seq_to_simplex(self,seqs):
+        return clampped_one_hot(seqs, self.K).float() * self.k * 2 - self.k # (B,L,K)
+
+    def forward(self, batch):
+        
+        # Ground truth at time step 1.
+        lig_seq_1, lig_coords_1, rotmats_1, trans_1 = batch['lig_seq_1'], batch['lig_coords_1'], batch['R_inv_1'], batch['t_inv_1']
+        lig_seq_1_simplex = self.seq_to_simplex(lig_seq_1)
+        lig_seq_1_prob = F.softmax(lig_seq_1_simplex,dim=-1)
+
+        rotmats_1 = rotmats_1.unsqueeze(1) # (B, 1, 3, 3)
+        trans_1 = trans_1.unsqueeze(1) # (B, 1, 3)
+
+        num_batch, num_lig = lig_seq_1.shape[0], lig_seq_1.shape[1]
+
+        with torch.no_grad():
+            t = torch.rand((num_batch, 1), device=batch['lig_seq_1'].device)
+            t = t * (1 - 2 * self._interpolant_cfg.min_t) + self._interpolant_cfg.min_t # avoid 0
+
+            # Randomly sample a translation vector from a normal distribution.
+            lig_coords_0 = torch.randn((num_batch, num_lig, 3), device=batch['lig_seq_1'].device)
+            lig_coords_t = (1 - t[...,None]) * lig_coords_0 + t[...,None] * lig_coords_1
+
+            # Randomly sample a rotation matrix from the uniform distribution on SO(3).
+            rotmats_0 = uniform_so3(num_batch, 1, device=batch['lig_seq_1'].device) # (B, 1, 3, 3)
+            # Obtein the rotation matrix at time t with exponential map.
+            rotmats_t = geodesic_t(t[..., None], rotmats_1, rotmats_0)
+
+            trans_0 = torch.randn((num_batch, 1, 3), device=batch['lig_seq_1'].device) * self._interpolant_cfg.trans.sigma # scale with sigma?
+            trans_t = (1 - t[...,None]) * trans_0 + t[...,None] * trans_1
+
+            # Randomly sample a sequence from the uniform distribution.
+            lig_seq_0_simplex = self.k * torch.randn_like(lig_seq_1_simplex) # (B,L,K)
+            lig_seq_0_prob = F.softmax(lig_seq_0_simplex, dim=-1) # (B,L,K)
+            lig_seq_t_simplex = ((1 - t[..., None]) * lig_seq_0_simplex) + (t[..., None] * lig_seq_1_simplex) # (B,L,K)
+            lig_seq_t_prob = F.softmax(lig_seq_t_simplex, dim=-1) # (B,L,K)
+            lig_seq_t = sample_from(lig_seq_t_prob) # (B,L)
+
+        return {
+            'lig_seq_t': lig_seq_t,
+            'lig_coords_t': lig_coords_t,
+            'rotmats_t': rotmats_t,
+            'trans_t': trans_t,
+        }
 
 
 # if __name__ == '__main__':
