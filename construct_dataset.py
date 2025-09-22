@@ -49,19 +49,35 @@ def read_ligand_pdb(pdb_path, sanitize=True, remove_hs=True, return_symbols=Fals
     if not os.path.isfile(pdb_path):
         raise FileNotFoundError(f"PDB file not found: {pdb_path}")
 
-    mol = Chem.MolFromPDBFile(pdb_path, sanitize=sanitize, removeHs=False)
+    # Enable proximity bonding to infer bonds when CONECT records are missing (common in ligand PDBs)
+    mol = Chem.MolFromPDBFile(pdb_path, sanitize=False, removeHs=False, proximityBonding=True)
     if mol is None:
         raise ValueError(f"Failed to load molecule from PDB: {pdb_path}")
+
+    # Try sanitize if requested, but be tolerant to valence issues in cofactors
+    if sanitize:
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            # Fallback: keep as-is to at least extract coordinates/elements
+            pass
 
     if mol.GetNumConformers() == 0:
         raise ValueError(f"No conformer/coordinates found in PDB: {pdb_path}")
 
+    # if remove_hs:
+    #     mol = Chem.RemoveHs(mol)
+
+    # conf = mol.GetConformer()
+    # positions = conf.GetPositions()
+
+    # atoms = list(mol.GetAtoms())
+    # Z = np.array([a.GetAtomicNum() for a in atoms], dtype=np.int32)
+    # coords = np.asarray(positions, dtype=np.float32)
     if remove_hs:
         mol = Chem.RemoveHs(mol)
-
     conf = mol.GetConformer()
     positions = conf.GetPositions()
-
     atoms = list(mol.GetAtoms())
     Z = np.array([a.GetAtomicNum() for a in atoms], dtype=np.int32)
     coords = np.asarray(positions, dtype=np.float32)
