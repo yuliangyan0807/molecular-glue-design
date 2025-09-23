@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.spatial.transform import Rotation
 
-from utils.so3_utils import geodesic_t, uniform_so3
+from utils.so3_utils import geodesic_t, uniform_so3, calc_rot_vf
+from models.vf_model import VFModel
 
 import copy
 import math
@@ -398,6 +398,8 @@ class TernaryFlowModel(nn.Module):
 
         self._interpolant_cfg = cfg.interpolant
 
+        self.vf_model = VFModel()
+
         self.K = self._interpolant_cfg.seqs.num_classes
         self.k = self._interpolant_cfg.seqs.simplex_value
     
@@ -438,12 +440,43 @@ class TernaryFlowModel(nn.Module):
             lig_seq_t_simplex = ((1 - t[..., None]) * lig_seq_0_simplex) + (t[..., None] * lig_seq_1_simplex) # (B,L,K)
             lig_seq_t_prob = F.softmax(lig_seq_t_simplex, dim=-1) # (B,L,K)
             lig_seq_t = sample_from(lig_seq_t_prob) # (B,L)
+        
+        # TODO Padding
+        
+        # Denoise
+        p1_coords, p1_seq, p2_coords, p2_seq = batch['p1_coords'], batch['p1_residue'], batch['p2_coords'], batch['p2_residue']
+        pred_lig_seq_1_prob, pred_lig_coords_1, pred_rotmats_1, pred_trans_1 = self.vf_model(t, lig_coords_t, rotmats_t, trans_t, lig_seq_t, p1_coords, p1_seq, p2_coords, p2_seq)
+        pred_lig_seq_1 = sample_from(F.softmax(pred_lig_seq_1_prob, dim=-1))
+
+        norm_scale = 1 / (1 - torch.min(t[...,None], torch.tensor(self._interpolant_cfg.t_normalization_clip))) # yim etal.trick, 1/1-t
+
+        # Translation Flow Matching loss, Euclidean Flow.
+        trans_loss = torch.sum((pred_trans_1 - trans_1) ** 2, dim=-1) # (B, )
+        trans_loss = torch.mean(trans_loss)
+
+        # Rotation Flow Matching loss, Riemannian Flow on SO(3).
+        gt_rot_vf = calc_rot_vf(rotmats_t, rotmats_1)
+        pred_rot_vf = calc_rot_vf(rotmats_t, pred_rotmats_1)
+        rot_loss = torch.sum(((gt_rot_vf - pred_rot_vf) * norm_scale) ** 2, dim=-1) # (B, )
+        rot_loss = torch.mean(rot_loss)
+
+        # Simplex Flow Matching loss, Simplex Flow on (K - 1)-simplex.
+        # pred_lig_seq_1_prob: (B, L, K)
+        seqs_loss = F.cross_entropy(
+            pred_lig_seq_1_prob.view(-1, pred_lig_seq_1_prob.size(-1)),  # (B * L, K)
+            lig_seq_1.view(-1)                                           # (B * L,)
+        )
+        seqs_loss = torch.mean(seqs_loss)
+
+        # 3D Coordinates Flow Matching loss, Euclidean Flow.
+        coords_loss = torch.sum((pred_lig_coords_1 - lig_coords_1) ** 2, dim=-1) # (B, )
+        coords_loss = torch.mean(coords_loss)
 
         return {
-            'lig_seq_t': lig_seq_t,
-            'lig_coords_t': lig_coords_t,
-            'rotmats_t': rotmats_t,
-            'trans_t': trans_t,
+            'trans_loss': trans_loss,
+            'rot_loss': rot_loss,
+            'seqs_loss': seqs_loss,
+            'coords_loss': coords_loss,
         }
 
 
