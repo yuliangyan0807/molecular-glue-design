@@ -6,6 +6,8 @@ from rdkit import Chem
 from copy import deepcopy
 from configs.config import DATASET_ARGS, DictToObject
 from pocket import get_elilipsoid_for_interface, get_interface_from_graphs
+from random import sample
+import json
 
 from datasets import Dataset, load_from_disk
 
@@ -243,16 +245,15 @@ def construct_flow_matching_dataset(
 
         # Mark if the complex has interface.
         name = os.path.basename(complex_dir)
-        if name not in complexes_with_interface:
-            interface_flag = False
-        else:
-            interface_flag = True
+
+        interface_flag = name in complexes_with_interface
 
         p1_path = os.path.join(complex_dir, 'protein1.pdb')
         p2_path = os.path.join(complex_dir, 'protein2.pdb')
         lig_path = os.path.join(complex_dir, 'ligand.pdb')
 
         lig_Z, lig_coords = read_ligand_pdb(lig_path, sanitize=True, remove_hs=ds_cfg.remove_h)
+        lig_coords_gt = deepcopy(lig_coords)
 
         # Build receptor graphs
         recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p1_path)
@@ -282,6 +283,18 @@ def construct_flow_matching_dataset(
         # Get the protein1 and protein2's residue sequence.
         p1_residue = p1_graph.ndata['feat'][:, 0]
         p2_residue = p2_graph.ndata['feat'][:, 0]
+
+        # Move all molecules to protein1's centroid as origin for training stability
+        p1_centroid = protein1_coords_gt.mean(dim=0, keepdims=True)  # [1, 3]
+        
+        # Move protein1 coordinates to origin
+        p1_graph.ndata['x'] = protein1_coords_gt - p1_centroid
+        
+        # Move protein2 coordinates relative to protein1's centroid
+        p2_graph.ndata['x'] = protein2_coords_gt - p1_centroid
+        
+        # Move ligand coordinates relative to protein1's centroid
+        lig_coords = lig_coords - p1_centroid.squeeze(0).numpy()
 
         # Randomly move one protein (p1 or p2) as in interface dataset
         move_p1 = random.random() < 0.5
@@ -319,6 +332,7 @@ def construct_flow_matching_dataset(
             'p2_coords': p2_coords,
             'lig_seq': np.asarray(lig_Z, dtype=np.int32),
             'lig_coords': np.asarray(lig_coords, dtype=np.float32),
+            'lig_coords_gt': np.asarray(lig_coords_gt, dtype=np.float32),
             'interface_flag': interface_flag,
         }
 
@@ -345,3 +359,21 @@ if __name__ == "__main__":
         data_dir="./data/TernaryDB/MGD_Train"
     )
     dataset = dataset.save_to_disk("flow_matching_dataset_v1")
+
+    # Randomly print 10 samples and save to .log
+    # dataset = load_from_disk("flow_matching_dataset_v1")
+    # num_samples = min(10, len(dataset))
+    # random_indices = sample(range(len(dataset)), num_samples)
+    # samples = [dataset[i] for i in random_indices]
+
+    # with open("random_samples.log", "w", encoding="utf-8") as f:
+    #     for i, sample_item in enumerate(samples):
+    #         f.write(f"Sample {i+1}:\n")
+    #         # Use json.dumps for pretty printing, handle numpy types
+    #         def default(o):
+    #             if hasattr(o, 'tolist'):
+    #                 return o.tolist()
+    #             return str(o)
+    #         f.write(json.dumps(sample_item, indent=2, default=default, ensure_ascii=False))
+    #         f.write("\n\n")
+    # print(f"Randomly printed {num_samples} samples and saved to random_samples.log")
