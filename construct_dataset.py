@@ -1,6 +1,7 @@
 import os
 import random
 import numpy as np
+import torch
 from tqdm import tqdm
 from rdkit import Chem
 from copy import deepcopy
@@ -267,6 +268,10 @@ def construct_flow_matching_dataset(
             c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
         )
         protein1_coords_gt = deepcopy(p1_graph.ndata['x'])
+        
+        # Store C and N coordinates for protein1
+        p1_n_coords_gt = torch.from_numpy(n_coords.astype(np.float32))
+        p1_c_coords_gt = torch.from_numpy(c_coords.astype(np.float32))
 
         recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p2_path)
         p2_graph = get_rec_graph(
@@ -279,6 +284,10 @@ def construct_flow_matching_dataset(
             c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
         )
         protein2_coords_gt = deepcopy(p2_graph.ndata['x'])
+        
+        # Store C and N coordinates for protein2
+        p2_n_coords_gt = torch.from_numpy(n_coords.astype(np.float32))
+        p2_c_coords_gt = torch.from_numpy(c_coords.astype(np.float32))
 
         # Get the protein1 and protein2's residue sequence.
         p1_residue = p1_graph.ndata['feat'][:, 0]
@@ -289,25 +298,26 @@ def construct_flow_matching_dataset(
         
         # Move protein1 coordinates to origin
         p1_graph.ndata['x'] = protein1_coords_gt - p1_centroid
+        p1_n_coords = p1_n_coords_gt - p1_centroid
+        p1_c_coords = p1_c_coords_gt - p1_centroid
         
         # Move protein2 coordinates relative to protein1's centroid
         p2_graph.ndata['x'] = protein2_coords_gt - p1_centroid
+        p2_n_coords = p2_n_coords_gt - p1_centroid
+        p2_c_coords = p2_c_coords_gt - p1_centroid
         
         # Move ligand coordinates relative to protein1's centroid
         lig_coords = lig_coords - p1_centroid.squeeze(0).numpy()
 
-        # Randomly move one protein (p1 or p2) as in interface dataset
-        move_p1 = random.random() < 0.5
-        if move_p1:
-            rot_T, rot_b = random_rotation_translation(translation_distance=5)
-            coords_to_move = p1_graph.ndata['x']
-            mean_to_remove = coords_to_move.mean(dim=0, keepdims=True)
-            p1_graph.ndata['x'] = (rot_T @ (coords_to_move - mean_to_remove).T).T + rot_b
-        else:
-            rot_T, rot_b = random_rotation_translation(translation_distance=5)
-            coords_to_move = p2_graph.ndata['x']
-            mean_to_remove = coords_to_move.mean(dim=0, keepdims=True)
-            p2_graph.ndata['x'] = (rot_T @ (coords_to_move - mean_to_remove).T).T + rot_b
+        # Fixed move protein2 as in interface dataset
+        rot_T, rot_b = random_rotation_translation(translation_distance=5)
+        coords_to_move = p2_graph.ndata['x']
+        mean_to_remove = coords_to_move.mean(dim=0, keepdims=True)
+        p2_graph.ndata['x'] = (rot_T @ (coords_to_move - mean_to_remove).T).T + rot_b
+        
+        # Apply same transformation to C and N coordinates
+        p2_n_coords = (rot_T @ (p2_n_coords - mean_to_remove).T).T + rot_b
+        p2_c_coords = (rot_T @ (p2_c_coords - mean_to_remove).T).T + rot_b
 
         # Compute inverse transform that maps moved protein back to original position
         # X_moved = R @ (X_orig - mean) + b  =>  X_orig = R^T @ X_moved + (mean - R^T @ b)
@@ -326,10 +336,20 @@ def construct_flow_matching_dataset(
             't_inv': t_inv,
             'p1_residue': p1_residue,
             'p2_residue': p2_residue,
-            'p1_coords_gt': protein1_coords_gt,
-            'p2_coords_gt': protein2_coords_gt,
-            'p1_coords': p1_coords,
-            'p2_coords': p2_coords,
+            'p1_coords_gt': protein1_coords_gt,  # C alpha coordinates
+            'p2_coords_gt': protein2_coords_gt,  # C alpha coordinates
+            'p1_coords': p1_coords,  # moved C alpha coordinates
+            'p2_coords': p2_coords,  # moved C alpha coordinates
+            # N coordinates
+            'p1_n_coords_gt': p1_n_coords_gt,
+            'p2_n_coords_gt': p2_n_coords_gt,
+            'p1_n_coords': p1_n_coords,
+            'p2_n_coords': p2_n_coords,
+            # C coordinates
+            'p1_c_coords_gt': p1_c_coords_gt,
+            'p2_c_coords_gt': p2_c_coords_gt,
+            'p1_c_coords': p1_c_coords,
+            'p2_c_coords': p2_c_coords,
             'lig_seq': np.asarray(lig_Z, dtype=np.int32),
             'lig_coords': np.asarray(lig_coords, dtype=np.float32),
             'lig_coords_gt': np.asarray(lig_coords_gt, dtype=np.float32),
@@ -358,7 +378,7 @@ if __name__ == "__main__":
     dataset = construct_flow_matching_dataset(
         data_dir="./data/TernaryDB/MGD_Train"
     )
-    dataset = dataset.save_to_disk("flow_matching_dataset_v1")
+    dataset = dataset.save_to_disk("flow_matching_dataset_v2")
 
     # Randomly print 10 samples and save to .log
     # dataset = load_from_disk("flow_matching_dataset_v1")
