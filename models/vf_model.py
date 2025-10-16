@@ -584,6 +584,70 @@ class PhiX(nn.Module):
 
         return phi_weights
 
+class PhiA(nn.Module):
+    """
+    It cross-attends protein features to ligand atoms and outputs sequence prediction probabilities φ_A.
+    Following the equation: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(s̃^(1), s̃^(2), ã_j^t, t)
+    """
+    def __init__(self, c_s, c_t, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.proj_s1 = nn.Linear(c_s, hidden_dim)
+        self.proj_s2 = nn.Linear(c_s, hidden_dim)
+        
+        # Projection for sequence embeddings ã_j^t
+        self.proj_a = nn.Linear(c_s, hidden_dim)
+        
+        self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        
+        # MLP outputs probability distribution over 20 amino acids
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + c_t, hidden_dim),  # 3H for s1, s2, a + c_t for time
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 20)  # Output probabilities for atom types
+        )
+
+    def forward(self, s1, s2, a_tilde, t_emb, p1_mask, p2_mask, mol_mask):
+        """
+        Args:
+            s1: (B, N1, c_s) - protein 1 features s̃^(1)
+            s2: (B, N2, c_s) - protein 2 features s̃^(2)
+            a_tilde: (B, N, c_s) - sequence embeddings ã_j^t at timestep t
+            t_emb: (B, N, c_t) - time embedding
+            p1_mask, p2_mask, mol_mask: boolean masks
+        Returns:
+            φ_A probabilities: (B, N, 20) - probability distribution over amino acids
+        """
+        B, N, c_s = a_tilde.shape
+        c_t = t_emb.shape[-1]
+
+        # Linear projections for protein features
+        s1_proj = self.proj_s1(s1)  # [B, N1, H]
+        s2_proj = self.proj_s2(s2)  # [B, N2, H]
+        
+        # Projection for sequence embeddings
+        a_proj = self.proj_a(a_tilde)  # [B, N, H]
+
+        # Cross-attend ligand sequence features to protein 1 and 2
+        attn_out_1, _ = self.cross_attn_1(a_proj, s1_proj, s1_proj,
+                                          key_padding_mask=~p1_mask)
+        attn_out_2, _ = self.cross_attn_2(a_proj, s2_proj, s2_proj,
+                                          key_padding_mask=~p2_mask)
+
+        # Combine attended features, sequence features, and time embedding
+        combined = torch.cat([attn_out_1, attn_out_2, a_proj, t_emb], dim=-1)  # [B, N, 3H + c_t]
+
+        # Output probability distribution over amino acids
+        phi_probs = self.mlp(combined)  # [B, N, 20]
+        
+        # Apply mask to invalid positions
+        phi_probs = phi_probs * mol_mask.unsqueeze(-1)
+
+        return phi_probs
+
 class TernaryDenoiseBlock(nn.Module):
     def __init__(self, ipa_conf):
         super().__init__()
@@ -604,32 +668,15 @@ class TernaryDenoiseBlock(nn.Module):
             hidden_dim=self._ipa_conf.c_s
         )
         
+        # Cross attention block to update the sequence of the molecular glue.
+        self.phi_A = PhiA(
+            c_s=self._ipa_conf.c_s,
+            c_t=self._ipa_conf.c_s,
+            hidden_dim=self._ipa_conf.c_s
+        )
+        
         # TODO: Specific the heavyatom types.
         self.seq_embedder = nn.Embedding(20, self._ipa_conf.c_s)
-        self.seq_net = nn.Sequential(
-            nn.Linear(self._ipa_conf.c_s + 2 * self._ipa_conf.c_s + self._ipa_conf.c_s, self._ipa_conf.c_s),nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, self._ipa_conf.c_s),nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, 20)
-            # nn.Linear(self._ipa_conf.c_s, 22)
-        )
-        
-        # Angular residual function φ_R
-        self.phi_R = nn.Sequential(
-            nn.Linear(2 * self._ipa_conf.c_s + 3 + 9 + 9 + 1, self._ipa_conf.c_s),  # s̃^(1), s̃^(2), X̃, Σ₁, Σ₂, timestep
-            nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, self._ipa_conf.c_s),
-            nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, 3)  # Output: angular residual Δω in R³
-        )
-        
-        # Translation residual function φ_t
-        self.phi_t = nn.Sequential(
-            nn.Linear(2 * self._ipa_conf.c_s + 3 + 1 + 1, self._ipa_conf.c_s),  # s̃^(1), s̃^(2), X̃, ||μ₁-μ₂||², timestep
-            nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, self._ipa_conf.c_s),
-            nn.ReLU(),
-            nn.Linear(self._ipa_conf.c_s, 3)  # Output: translation residual Δt
-        )
     
     def embed_t(self, timesteps, mask):
         timestep_emb = get_time_embedding(
@@ -670,6 +717,9 @@ class TernaryDenoiseBlock(nn.Module):
         X_j = X_tilde.unsqueeze(1)  # [B, 1, N, 3]
         coord_diffs = X_i - X_j     # [B, N, N, 3]
 
+        #########################################################
+        # Molecular glue coordinate prediction.
+        #########################################################
         # Create combined mask: mask out self-interactions and padding atoms
         self_mask = torch.eye(N, device=X_tilde.device, dtype=torch.bool).unsqueeze(0).unsqueeze(-1)  # [1, N, N, 1]
         mol_mask_2d = mol_mask.unsqueeze(2) & mol_mask.unsqueeze(1)  # [B, N, N] - valid pairs
@@ -689,21 +739,41 @@ class TernaryDenoiseBlock(nn.Module):
         X_pred = torch.sum(coord_diffs * phi_weights, dim=2)  # [B, N, 3]
         X_pred = X_pred * mol_mask.unsqueeze(-1)  # Apply final mask for safety
 
-        # Sequence prediction: aggregate protein context and ligand features
-        seq_embed = self.seq_embedder(seq_tilde)  # [B, N, c_s]
+        #########################################################
+        # Molecular glue sequence prediction.
+        #########################################################
+        # Sequence prediction using PhiA: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(s̃^(1), s̃^(2), ã_j^t, t)
+        seq_embed = self.seq_embedder(seq_tilde)  # [B, N, c_s] - ã_j^t
         
-        # Pool protein features and broadcast to each ligand atom
-        s1_pooled = s1_tilde.mean(dim=1, keepdim=True)  # [B, 1, c_s]
-        s2_pooled = s2_tilde.mean(dim=1, keepdim=True)  # [B, 1, c_s]
+        # Get probability distributions from PhiA for each atom
+        phi_a_probs = self.phi_A(s1_tilde, s2_tilde, seq_embed, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 20]
         
-        phi_a_input = torch.cat([
-            s1_pooled.expand(-1, N, -1),
-            s2_pooled.expand(-1, N, -1),
-            t_emb, 
-            seq_embed
-        ], dim=-1)  # [B, N, 4*c_s]
+        # Compute pairwise distances between predicted coordinates
+        X_pred_i = X_pred.unsqueeze(2)  # [B, N, 1, 3]
+        X_pred_j = X_pred.unsqueeze(1)  # [B, 1, N, 3]
+        pred_coord_diffs = X_pred_i - X_pred_j  # [B, N, N, 3]
+        pred_distances_sq = torch.sum(pred_coord_diffs ** 2, dim=-1)  # [B, N, N]
         
-        seq_pred = self.seq_net(phi_a_input)  # [B, N, 20]
+        # Apply the same masking as PhiX (mask out self-interactions and invalid pairs)
+        pred_distances_sq = pred_distances_sq.masked_fill(combined_mask.squeeze(-1), 0.0)  # [B, N, N]
+        
+        # Weighted aggregation: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
+        # Expand phi_a_probs for pairwise computation: [B, N, 20] -> [B, N, N, 20]
+        phi_a_probs_expanded = phi_a_probs.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, 20]
+        
+        # Weight by distances: [B, N, N, 1] * [B, N, N, 20] = [B, N, N, 20]
+        weighted_probs = pred_distances_sq.unsqueeze(-1) * phi_a_probs_expanded  # [B, N, N, 20]
+        
+        # Sum over j: Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
+        seq_pred = torch.sum(weighted_probs, dim=2)  # [B, N, 20]
+        
+        # Apply final mask
+        seq_pred = seq_pred * mol_mask.unsqueeze(-1)
+
+        #########################################################
+        # Rotation matrix  prediction to move the protein 2 to the final ternary complex.
+        #########################################################
+        
 
         return X_pred, seq_pred
 
