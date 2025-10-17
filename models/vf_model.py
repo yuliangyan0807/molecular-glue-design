@@ -7,6 +7,7 @@ from typing import Optional, Callable, List, Sequence
 
 from utils.rigid_utils import construct_3d_basis, global_to_local
 from openfold.utils import rigid_utils as ru, Rigid
+from utils.so3_utils import rotvec_to_rotmat, rotmat_to_rotvec
 
 def create_rigid(rots, trans):
     rots = ru.Rotation(rot_mats=rots)
@@ -565,6 +566,7 @@ class PhiX(nn.Module):
         coord_features = torch.mean(coord_invariants, dim=2)  # [B, N, 4]
         # Use all 4 invariant features: [distance, |dx|, |dy|, |dz|]
         ligand_queries = self.coord_to_query(coord_features)  # [B, N, H]
+        ligand_queries = ligand_queries * mol_mask.unsqueeze(-1)  # Apply mask to queries
 
         # Cross-attend ligand to protein 1 and 2
         attn_out_1, _ = self.cross_attn_1(ligand_queries, s1_proj, s1_proj,
@@ -572,8 +574,11 @@ class PhiX(nn.Module):
         attn_out_2, _ = self.cross_attn_2(ligand_queries, s2_proj, s2_proj,
                                           key_padding_mask=~p2_mask)
 
+        # Apply mask to time embedding
+        t_emb_masked = t_emb * mol_mask.unsqueeze(-1)
+        
         # Combine attended features and time embedding
-        combined = torch.cat([attn_out_1, attn_out_2, t_emb], dim=-1)  # [B, N, 2H + c_t]
+        combined = torch.cat([attn_out_1, attn_out_2, t_emb_masked], dim=-1)  # [B, N, 2H + c_t]
 
         # Pairwise expansion and fusion with coord_diffs
         combined_i = combined.unsqueeze(2).expand(-1, N, N, -1)  # [B, N, N, 2H + c_t]
@@ -628,8 +633,9 @@ class PhiA(nn.Module):
         s1_proj = self.proj_s1(s1)  # [B, N1, H]
         s2_proj = self.proj_s2(s2)  # [B, N2, H]
         
-        # Projection for sequence embeddings
+        # Projection for sequence embeddings and apply mask to exclude padding
         a_proj = self.proj_a(a_tilde)  # [B, N, H]
+        a_proj = a_proj * mol_mask.unsqueeze(-1)  # Zero out padding positions
 
         # Cross-attend ligand sequence features to protein 1 and 2
         attn_out_1, _ = self.cross_attn_1(a_proj, s1_proj, s1_proj,
@@ -637,16 +643,103 @@ class PhiA(nn.Module):
         attn_out_2, _ = self.cross_attn_2(a_proj, s2_proj, s2_proj,
                                           key_padding_mask=~p2_mask)
 
+        # Apply mask to time embedding as well
+        t_emb_masked = t_emb * mol_mask.unsqueeze(-1)
+        
         # Combine attended features, sequence features, and time embedding
-        combined = torch.cat([attn_out_1, attn_out_2, a_proj, t_emb], dim=-1)  # [B, N, 3H + c_t]
+        combined = torch.cat([attn_out_1, attn_out_2, a_proj, t_emb_masked], dim=-1)  # [B, N, 3H + c_t]
 
         # Output probability distribution over amino acids
         phi_probs = self.mlp(combined)  # [B, N, 20]
         
-        # Apply mask to invalid positions
+        # Apply mask to invalid positions (final safeguard)
         phi_probs = phi_probs * mol_mask.unsqueeze(-1)
 
         return phi_probs
+
+class PhiR(nn.Module):
+    """
+    Predicts rotation matrix R_pred using local protein coordinate frames.
+    Ensures E(3)-equivariance by grounding predictions in relative orientation.
+    """
+    def __init__(self, c_s, c_t, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.proj_s1 = nn.Linear(c_s, hidden_dim)
+        self.proj_s2 = nn.Linear(c_s, hidden_dim)
+        self.proj_r = nn.Linear(3, hidden_dim)  # Project rotation vector (R^3)
+        self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + c_t, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3)  # Output rotation vector in R^3
+        )
+
+    def forward(self, s1, s2, R_tilde, t_emb,
+                p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
+                p1_mask, p2_mask, mol_mask):
+        """
+        Args:
+            s1, s2: (B, N, c_s) - protein embeddings
+            R_tilde: (B, 3, 3) - current rotation
+            t_emb: (B, N, c_t) - time embedding for molecular glue
+            p1_coords, p2_coords: (B, N, 3) - CA coordinates
+            p1_n_coords, p2_n_coords: (B, N, 3) - N coordinates
+            p1_c_coords, p2_c_coords: (B, N, 3) - C coordinates
+            p1_mask, p2_mask: (B, N) - residue masks
+            mol_mask: (B, N) - molecular glue mask
+        """
+        # Construct local coordinate frames
+        # Use mask to exclude padding coordinates from centroid calculation
+        # keepdim=True is necessary because construct_3d_basis expects (N, L, 3) not (N, 3)
+        
+        # Compute masked mean for protein 1
+        p1_mask_expanded = p1_mask.unsqueeze(-1)  # (B, N, 1)
+        p1_ca_mean = (p1_coords * p1_mask_expanded).sum(1, keepdim=True) / (p1_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        p1_c_mean = (p1_c_coords * p1_mask_expanded).sum(1, keepdim=True) / (p1_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        p1_n_mean = (p1_n_coords * p1_mask_expanded).sum(1, keepdim=True) / (p1_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        
+        # Compute masked mean for protein 2
+        p2_mask_expanded = p2_mask.unsqueeze(-1)  # (B, N, 1)
+        p2_ca_mean = (p2_coords * p2_mask_expanded).sum(1, keepdim=True) / (p2_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        p2_c_mean = (p2_c_coords * p2_mask_expanded).sum(1, keepdim=True) / (p2_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        p2_n_mean = (p2_n_coords * p2_mask_expanded).sum(1, keepdim=True) / (p2_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        
+        R1 = construct_3d_basis(p1_ca_mean, p1_c_mean, p1_n_mean)  # (B, 1, 3, 3)
+        R2 = construct_3d_basis(p2_ca_mean, p2_c_mean, p2_n_mean)  # (B, 1, 3, 3)
+        
+        # R1, R2 are (B, 1, 3, 3), squeeze to (B, 3, 3)
+        R1 = R1.squeeze(1)  # (B, 3, 3)
+        R2 = R2.squeeze(1)  # (B, 3, 3)
+
+        # local relative rotation
+        R_rel = torch.matmul(R1.transpose(-1, -2), R2)  # (B, 3, 3)
+        
+        # Convert R_rel to rotation vector for feature projection
+        omega_rel = rotmat_to_rotvec(R_rel)  # (B, 3)
+
+        s1_proj = self.proj_s1(s1)
+        s2_proj = self.proj_s2(s2)
+        r_proj = self.proj_r(omega_rel).unsqueeze(1)  # (B, 1, hidden_dim)
+
+        attn_out_1, _ = self.cross_attn_1(r_proj, s1_proj, s1_proj, key_padding_mask=~p1_mask)
+        attn_out_2, _ = self.cross_attn_2(r_proj, s2_proj, s2_proj, key_padding_mask=~p2_mask)
+
+        # Compute masked mean of time embedding
+        mol_mask_expanded = mol_mask.unsqueeze(-1)  # (B, N, 1)
+        t_emb_mean = (t_emb * mol_mask_expanded).sum(1, keepdim=True) / (mol_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)  # (B, 1, c_t)
+        
+        combined = torch.cat([attn_out_1, attn_out_2, r_proj, t_emb_mean], dim=-1)
+        delta_omega = self.mlp(combined).view(-1, 3)  # Angular residual in R^3, [B, 3]
+        R_delta = rotvec_to_rotmat(delta_omega)  # Lie algebra exponential map: exp([Δω]_×), [B, 3, 3]
+
+        R_pred = R_delta @ R_tilde  # [B, 3, 3]
+
+        return R_pred
+
 
 class TernaryDenoiseBlock(nn.Module):
     def __init__(self, ipa_conf):
@@ -687,7 +780,7 @@ class TernaryDenoiseBlock(nn.Module):
 
         return timestep_emb
 
-    def forward(self, s1, s2, z1, z2, I1, I2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_mask, p2_mask, mol_mask):
+    def forward(self, s1, s2, z1, z2, I1, I2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords, p1_mask, p2_mask, mol_mask):
         """
         Ternary Denoise Block forward pass according to Algorithm 2
         
@@ -773,9 +866,11 @@ class TernaryDenoiseBlock(nn.Module):
         #########################################################
         # Rotation matrix  prediction to move the protein 2 to the final ternary complex.
         #########################################################
-        
+        R_pred = self.phi_R(s1_tilde, s2_tilde, R_tilde, t_emb,
+                            p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
+                            p1_mask, p2_mask, mol_mask)
 
-        return X_pred, seq_pred
+        return X_pred, seq_pred, R_pred
 
 class VFModel(nn.Module):
     def __init__(self, cfg):
