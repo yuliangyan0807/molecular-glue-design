@@ -741,6 +741,73 @@ class PhiR(nn.Module):
         return R_pred
 
 
+class PhiT(nn.Module):
+    """
+    Predicts translation vector t_pred using local protein coordinate frames.
+    Ensures E(3)-equivariance by grounding predictions in relative translation.
+    """
+    def __init__(self, c_s, c_t, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.proj_s1 = nn.Linear(c_s, hidden_dim)
+        self.proj_s2 = nn.Linear(c_s, hidden_dim)
+        self.proj_dist = nn.Linear(1, hidden_dim)  # Project distance feature
+        self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + c_t, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3)  # Output translation vector in R^3
+        )
+
+    def forward(self, s1, s2, t_emb, R_pred,
+                p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
+                p1_mask, p2_mask, mol_mask):
+        """
+        Args:
+            s1, s2: (B, N, c_s) - protein embeddings
+            t_emb: (B, N, c_t) - time embedding for molecular glue
+            R_pred: (B, 3, 3) - predicted rotation matrix
+            p1_coords, p2_coords: (B, N, 3) - CA coordinates
+            p1_n_coords, p2_n_coords: (B, N, 3) - N coordinates
+            p1_c_coords, p2_c_coords: (B, N, 3) - C coordinates
+            p1_mask, p2_mask: (B, N) - residue masks
+            mol_mask: (B, N) - molecular glue mask
+        """
+        # Compute protein centroids (μ1, μ2)
+        # Use mask to exclude padding coordinates from centroid calculation
+        
+        # Compute masked mean for protein 1
+        p1_mask_expanded = p1_mask.unsqueeze(-1)  # (B, N, 1)
+        p1_ca_mean = (p1_coords * p1_mask_expanded).sum(1, keepdim=True) / (p1_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        
+        # Compute masked mean for protein 2
+        p2_mask_expanded = p2_mask.unsqueeze(-1)  # (B, N, 1)
+        p2_ca_mean = (p2_coords * p2_mask_expanded).sum(1, keepdim=True) / (p2_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)
+        
+        # Compute distance between centroids: ||μ1 - μ2||₂²
+        centroid_diff = p1_ca_mean - p2_ca_mean  # (B, 1, 3)
+        centroid_dist_sq = torch.sum(centroid_diff ** 2, dim=-1, keepdim=True)  # (B, 1, 1)
+        
+        s1_proj = self.proj_s1(s1)
+        s2_proj = self.proj_s2(s2)
+        dist_proj = self.proj_dist(centroid_dist_sq).unsqueeze(1)  # (B, 1, hidden_dim)
+
+        attn_out_1, _ = self.cross_attn_1(dist_proj, s1_proj, s1_proj, key_padding_mask=~p1_mask)
+        attn_out_2, _ = self.cross_attn_2(dist_proj, s2_proj, s2_proj, key_padding_mask=~p2_mask)
+
+        # Compute masked mean of time embedding
+        mol_mask_expanded = mol_mask.unsqueeze(-1)  # (B, N, 1)
+        t_emb_mean = (t_emb * mol_mask_expanded).sum(1, keepdim=True) / (mol_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)  # (B, 1, c_t)
+        
+        combined = torch.cat([attn_out_1, attn_out_2, dist_proj, t_emb_mean], dim=-1)
+        delta_t = self.mlp(combined).view(-1, 3)  # Translation residual in R^3, [B, 3]
+
+        return delta_t
+
+
 class TernaryDenoiseBlock(nn.Module):
     def __init__(self, ipa_conf):
         super().__init__()
@@ -763,6 +830,20 @@ class TernaryDenoiseBlock(nn.Module):
         
         # Cross attention block to update the sequence of the molecular glue.
         self.phi_A = PhiA(
+            c_s=self._ipa_conf.c_s,
+            c_t=self._ipa_conf.c_s,
+            hidden_dim=self._ipa_conf.c_s
+        )
+        
+        # Rotation prediction module
+        self.phi_R = PhiR(
+            c_s=self._ipa_conf.c_s,
+            c_t=self._ipa_conf.c_s,
+            hidden_dim=self._ipa_conf.c_s
+        )
+        
+        # Translation prediction module
+        self.phi_T = PhiT(
             c_s=self._ipa_conf.c_s,
             c_t=self._ipa_conf.c_s,
             hidden_dim=self._ipa_conf.c_s
@@ -870,7 +951,17 @@ class TernaryDenoiseBlock(nn.Module):
                             p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
                             p1_mask, p2_mask, mol_mask)
 
-        return X_pred, seq_pred, R_pred
+        #########################################################
+        # Translation vector prediction to move the protein 2 to the final ternary complex.
+        #########################################################
+        delta_t = self.phi_T(s1_tilde, s2_tilde, t_emb, R_pred,
+                            p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
+                            p1_mask, p2_mask, mol_mask)
+        
+        # Apply the rotation to the translation residual: t_pred = t_tilde + R_pred * Δt
+        t_pred = t_tilde + torch.matmul(R_pred, delta_t.unsqueeze(-1)).squeeze(-1)  # [B, 3]
+
+        return X_pred, seq_pred, R_pred, t_pred
 
 class VFModel(nn.Module):
     def __init__(self, cfg):
