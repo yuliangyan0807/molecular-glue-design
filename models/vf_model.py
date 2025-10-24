@@ -861,7 +861,7 @@ class TernaryDenoiseBlock(nn.Module):
 
         return timestep_emb
 
-    def forward(self, s1, s2, z1, z2, I1, I2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords, p1_mask, p2_mask, mol_mask):
+    def forward(self, s1, s2, z1, z2, I1, I2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords, i1_repr, i2_repr, p1_mask, p2_mask, mol_mask):
         """
         Ternary Denoise Block forward pass according to Algorithm 2
         
@@ -879,10 +879,10 @@ class TernaryDenoiseBlock(nn.Module):
         
         # Obtain the single representation of the two proteins with IIPA block.
         # TODO: add the interface representation.
-        s1_tilde = self.iipa(s1, z1, T1, p1_mask) # (B, N1, c_s)
+        s1_tilde = self.iipa(s1, z1, T1, p1_mask, i1_repr) # (B, N1, c_s)
         s1_tilde = self.iipa_ln(s1_tilde)
         
-        s2_tilde = self.iipa(s2, z2, T2, p2_mask) # (B, N2, c_s)
+        s2_tilde = self.iipa(s2, z2, T2, p2_mask, i2_repr) # (B, N2, c_s)
         s2_tilde = self.iipa_ln(s2_tilde)
         
         # Compute pairwise coordinate differences between molecular glue atoms
@@ -969,13 +969,78 @@ class VFModel(nn.Module):
         
         self.node_embedder = NodeEmbedder(cfg.node_embed_size)
         self.edge_embedder = EdgeEmbedder(cfg.edge_embed_size)
+        
+        # Initialize TernaryDenoiseBlock with IPA configuration
+        self.ternary_denoise_block = TernaryDenoiseBlock(cfg.ipa)
 
-    def encode(self, batch):
-        rotmats_p1 = construct_3d_basis(batch['p1_coords'], batch['p1_c_coords'], batch['p1_n_coords'])
-        rotmats_p2 = construct_3d_basis(batch['p2_coords'], batch['p2_c_coords'], batch['p2_n_coords'])
-        trans_p1 = batch['p1_coords']
-        trans_p2 = batch['p2_coords']
+    def encode(self, p1_coords, p1_c_coords, p1_n_coords, p1_seq, p1_mask, p2_coords, p2_c_coords, p2_n_coords, p2_seq, p2_mask):
+        """
+        Encode protein features using node and edge embedders
+        
+        Args:
+            batch: Dictionary containing protein data
+                - p1_coords, p2_coords: CA coordinates (B, N, 3)
+                - p1_c_coords, p2_c_coords: C coordinates (B, N, 3) 
+                - p1_n_coords, p2_n_coords: N coordinates (B, N, 3)
+                - p1_residue, p2_residue: amino acid sequences (B, N)
+                - p1_mask, p2_mask: residue masks (B, N)
+        
+        Returns:
+            Dictionary containing encoded features and rigid transformations
+        """
+        # Construct rigid transformations for both proteins
+        rotmats_p1 = construct_3d_basis(p1_coords, p1_c_coords, p1_n_coords) 
+        rotmats_p2 = construct_3d_basis(p2_coords, p2_c_coords, p2_n_coords)
+        trans_p1 = p1_coords
+        trans_p2 = p2_coords
+        
+        # Create rigid objects for both proteins
+        T1 = create_rigid(rotmats_p1, trans_p1)
+        T2 = create_rigid(rotmats_p2, trans_p2)
+        
+        # Encode node features (single representations)
+        s1 = self.node_embedder(p1_seq, p1_mask)   # (B, N1, c_s)
+        s2 = self.node_embedder(p2_seq, p2_mask)  # (B, N2, c_s)
+        
+        # Encode edge features (pair representations)  
+        z1 = self.edge_embedder(p1_seq, p1_coords, p1_n_coords, p1_c_coords, p1_mask)  # (B, N1, N1, c_z)
+        z2 = self.edge_embedder(p2_seq, p2_coords, p2_n_coords, p2_c_coords, p2_mask)  # (B, N2, N2, c_z)
+        
+        return s1, s2, z1, z2, T1, T2
         
 
-    def forward(self,):
-        pass
+    def forward(self, t, lig_coords_t, rotmats_t, trans_t, lig_seq_t, p1_coords, p1_c_coords, p1_n_coords, p1_seq, p1_mask, p2_coords, p2_c_coords, p2_n_coords, p2_seq, p2_mask, mol_mask, i1_repr, i2_repr):
+        """
+        Forward pass using TernaryDenoiseBlock
+        
+        Args:
+            t: Current timestep (B, 1)
+            lig_coords_t: Noised molecular glue coordinates (B, N, 3)
+            rotmats_t: Noised rotation matrix (B, 3, 3)
+            trans_t: Noised translation vector (B, 3)
+            lig_seq_t: Noised molecular glue sequence (B, N)
+            p1_coords, p1_c_coords, p1_n_coords: Protein 1 coordinates (B, N, 3)
+            p1_seq: Protein 1 sequence (B, N)
+            p1_mask: Protein 1 mask (B, N)
+            p2_coords, p2_c_coords, p2_n_coords: Protein 2 coordinates (B, N, 3)
+            p2_seq: Protein 2 sequence (B, N)
+            p2_mask: Protein 2 mask (B, N)
+            mol_mask: Molecular glue mask (B, N)
+            i1_repr, i2_repr: Interface representations (B, N, feat_dim), optional
+        
+        Returns:
+            Tuple of predictions: (seq_pred, coords_pred, rot_pred, trans_pred)
+        """
+        s1, s2, z1, z2, T1, T2 = self.encode(p1_coords, p1_c_coords, p1_n_coords, p1_seq, p1_mask, p2_coords, p2_c_coords, p2_n_coords, p2_seq, p2_mask)
+        
+        # Use TernaryDenoiseBlock for denoising
+        coords_pred, seq_pred, rot_pred, trans_pred = self.ternary_denoise_block(
+            s1=s1, s2=s2, z1=z1, z2=z2, T1=T1, T2=T2,
+            seq_tilde=lig_seq_t, X_tilde=lig_coords_t, R_tilde=rotmats_t, t_tilde=trans_t, t=t,
+            p1_coords=p1_coords, p2_coords=p2_coords, i1_repr=i1_repr, i2_repr=i2_repr,
+            p1_n_coords=p1_n_coords, p2_n_coords=p2_n_coords,
+            p1_c_coords=p1_c_coords, p2_c_coords=p2_c_coords,
+            p1_mask=p1_mask, p2_mask=p2_mask, mol_mask=mol_mask
+        )
+        
+        return seq_pred, coords_pred, rot_pred, trans_pred
