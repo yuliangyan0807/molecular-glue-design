@@ -79,7 +79,10 @@ class TernaryFlowModel(nn.Module):
 
         # Obtain the interface guidance.
         p1_residue, p1_coords, p2_residue, p2_coords = batch['p1_residue'], batch['p1_coords'], batch['p2_residue'], batch['p2_coords']
-        i1_repr, i2_repr = self.interface_model(p1_residue, p1_coords, p2_residue, p2_coords)
+        p1_mask, p2_mask = batch['p1_mask'], batch['p2_mask']
+        output = self.interface_model(p1_residue, p1_coords, p2_residue, p2_coords, p1_mask, p2_mask)
+        i1_repr, i2_repr = output['i1_repr'], output['i2_repr']
+        
         mol_mask = batch['mol_mask']
         
         # Denoise

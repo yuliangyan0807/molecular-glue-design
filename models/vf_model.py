@@ -6,7 +6,8 @@ import torch.nn as nn
 from typing import Optional, Callable, List, Sequence
 
 from utils.rigid_utils import construct_3d_basis, global_to_local
-from openfold.utils import rigid_utils as ru, Rigid
+from openfold.utils import rigid_utils as ru
+from openfold.utils.rigid_utils import Rigid
 from utils.so3_utils import rotvec_to_rotmat, rotmat_to_rotvec
 
 def create_rigid(rots, trans):
@@ -347,6 +348,7 @@ class InvariantPointAttention(nn.Module):
         mask: torch.Tensor,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        i_repr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -446,7 +448,9 @@ class InvariantPointAttention(nn.Module):
         # [*, N_res, N_res, H]
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
         # [*, N_res, N_res]
-        square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        # BUG
+        # square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        square_mask = mask.float().unsqueeze(-1) * mask.float().unsqueeze(-2)
         square_mask = self.inf * (square_mask - 1)
 
         # [*, H, N_res, N_res]
@@ -861,7 +865,7 @@ class TernaryDenoiseBlock(nn.Module):
 
         return timestep_emb
 
-    def forward(self, s1, s2, z1, z2, I1, I2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords, i1_repr, i2_repr, p1_mask, p2_mask, mol_mask):
+    def forward(self, s1, s2, z1, z2, T1, T2, seq_tilde, X_tilde, R_tilde, t_tilde, t, p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords, i1_repr, i2_repr, p1_mask, p2_mask, mol_mask):
         """
         Ternary Denoise Block forward pass according to Algorithm 2
         
@@ -879,10 +883,10 @@ class TernaryDenoiseBlock(nn.Module):
         
         # Obtain the single representation of the two proteins with IIPA block.
         # TODO: add the interface representation.
-        s1_tilde = self.iipa(s1, z1, T1, p1_mask, i1_repr) # (B, N1, c_s)
+        s1_tilde = self.iipa(s=s1, z=z1, r=T1, mask=p1_mask, i_repr=i1_repr) # (B, N1, c_s)
         s1_tilde = self.iipa_ln(s1_tilde)
         
-        s2_tilde = self.iipa(s2, z2, T2, p2_mask, i2_repr) # (B, N2, c_s)
+        s2_tilde = self.iipa(s=s2, z=z2, r=T2, mask=p2_mask, i_repr=i2_repr) # (B, N2, c_s)
         s2_tilde = self.iipa_ln(s2_tilde)
         
         # Compute pairwise coordinate differences between molecular glue atoms
@@ -1037,10 +1041,10 @@ class VFModel(nn.Module):
         coords_pred, seq_pred, rot_pred, trans_pred = self.ternary_denoise_block(
             s1=s1, s2=s2, z1=z1, z2=z2, T1=T1, T2=T2,
             seq_tilde=lig_seq_t, X_tilde=lig_coords_t, R_tilde=rotmats_t, t_tilde=trans_t, t=t,
-            p1_coords=p1_coords, p2_coords=p2_coords, i1_repr=i1_repr, i2_repr=i2_repr,
+            p1_coords=p1_coords, p2_coords=p2_coords,
             p1_n_coords=p1_n_coords, p2_n_coords=p2_n_coords,
             p1_c_coords=p1_c_coords, p2_c_coords=p2_c_coords,
-            p1_mask=p1_mask, p2_mask=p2_mask, mol_mask=mol_mask
+            p1_mask=p1_mask, p2_mask=p2_mask, mol_mask=mol_mask, i1_repr=i1_repr, i2_repr=i2_repr
         )
         
         return seq_pred, coords_pred, rot_pred, trans_pred
