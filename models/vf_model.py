@@ -797,7 +797,7 @@ class PhiT(nn.Module):
         
         s1_proj = self.proj_s1(s1)
         s2_proj = self.proj_s2(s2)
-        dist_proj = self.proj_dist(centroid_dist_sq).unsqueeze(1)  # (B, 1, hidden_dim)
+        dist_proj = self.proj_dist(centroid_dist_sq)  # (B, 1, hidden_dim)
 
         attn_out_1, _ = self.cross_attn_1(dist_proj, s1_proj, s1_proj, key_padding_mask=~p1_mask)
         attn_out_2, _ = self.cross_attn_2(dist_proj, s2_proj, s2_proj, key_padding_mask=~p2_mask)
