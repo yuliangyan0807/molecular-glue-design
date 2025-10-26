@@ -1,5 +1,4 @@
 # Copyright (c) 2024. This code is built upon https://github.com/Ced3-han/PepFlowww
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,8 +6,6 @@ import torch.nn.functional as F
 from utils.so3_utils import geodesic_t, uniform_so3, calc_rot_vf
 from models.vf_model import VFModel
 from models.interface_model import InterfaceModel
-
-# collate_fn = PaddingCollate(eight=False)
 
 # Helper functions
 def clampped_one_hot(x, num_classes):
@@ -74,8 +71,6 @@ class TernaryFlowModel(nn.Module):
             lig_seq_t_simplex = ((1 - t[..., None]) * lig_seq_0_simplex) + (t[..., None] * lig_seq_1_simplex) # (B,L,K)
             lig_seq_t_prob = F.softmax(lig_seq_t_simplex, dim=-1) # (B,L,K)
             lig_seq_t = sample_from(lig_seq_t_prob) # (B,L)
-        
-        # TODO Padding
 
         # Obtain the interface guidance.
         p1_residue, p1_coords, p2_residue, p2_coords = batch['p1_residue'], batch['p1_coords'], batch['p2_residue'], batch['p2_coords']
@@ -90,9 +85,6 @@ class TernaryFlowModel(nn.Module):
         p1_c_coords, p1_n_coords = batch['p1_c_coords'], batch['p1_n_coords']
         p2_c_coords, p2_n_coords = batch['p2_c_coords'], batch['p2_n_coords']
         p1_mask, p2_mask = batch['p1_mask'], batch['p2_mask']
-        
-        # Create molecular glue mask (assuming all ligand atoms are valid)
-        # mol_mask = torch.ones(lig_coords_t.shape[:2], device=lig_coords_t.device, dtype=torch.bool)
         
         # Compute the vector field and predict the raw data at time step 1.
         pred_lig_seq_1_prob, pred_lig_coords_1, pred_rotmats_1, pred_trans_1 = self.vf_model(

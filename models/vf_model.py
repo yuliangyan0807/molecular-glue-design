@@ -610,13 +610,13 @@ class PhiA(nn.Module):
         self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         
-        # MLP outputs probability distribution over 20 amino acids
+        # MLP outputs probability distribution over 54 atom types
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim * 3 + c_t, hidden_dim),  # 3H for s1, s2, a + c_t for time
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 20)  # Output probabilities for atom types
+            nn.Linear(hidden_dim, 54)  # Output probabilities for atom types
         )
 
     def forward(self, s1, s2, a_tilde, t_emb, p1_mask, p2_mask, mol_mask):
@@ -628,7 +628,7 @@ class PhiA(nn.Module):
             t_emb: (B, N, c_t) - time embedding
             p1_mask, p2_mask, mol_mask: boolean masks
         Returns:
-            φ_A probabilities: (B, N, 20) - probability distribution over amino acids
+            φ_A probabilities: (B, N, 54) - probability distribution over atom types
         """
         B, N, c_s = a_tilde.shape
         c_t = t_emb.shape[-1]
@@ -653,8 +653,8 @@ class PhiA(nn.Module):
         # Combine attended features, sequence features, and time embedding
         combined = torch.cat([attn_out_1, attn_out_2, a_proj, t_emb_masked], dim=-1)  # [B, N, 3H + c_t]
 
-        # Output probability distribution over amino acids
-        phi_probs = self.mlp(combined)  # [B, N, 20]
+        # Output probability distribution over atom types
+        phi_probs = self.mlp(combined)  # [B, N, 54]
         
         # Apply mask to invalid positions (final safeguard)
         phi_probs = phi_probs * mol_mask.unsqueeze(-1)
@@ -854,7 +854,8 @@ class TernaryDenoiseBlock(nn.Module):
         )
         
         # TODO: Specific the heavyatom types.
-        self.seq_embedder = nn.Embedding(20, self._ipa_conf.c_s)
+        # 54 atom types. 118 in total.
+        self.seq_embedder = nn.Embedding(54, self._ipa_conf.c_s)
     
     def embed_t(self, timesteps, mask):
         timestep_emb = get_time_embedding(
@@ -924,7 +925,7 @@ class TernaryDenoiseBlock(nn.Module):
         seq_embed = self.seq_embedder(seq_tilde)  # [B, N, c_s] - ã_j^t
         
         # Get probability distributions from PhiA for each atom
-        phi_a_probs = self.phi_A(s1_tilde, s2_tilde, seq_embed, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 20]
+        phi_a_probs = self.phi_A(s1_tilde, s2_tilde, seq_embed, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 54]
         
         # Compute pairwise distances between predicted coordinates
         X_pred_i = X_pred.unsqueeze(2)  # [B, N, 1, 3]
@@ -936,14 +937,14 @@ class TernaryDenoiseBlock(nn.Module):
         pred_distances_sq = pred_distances_sq.masked_fill(combined_mask.squeeze(-1), 0.0)  # [B, N, N]
         
         # Weighted aggregation: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
-        # Expand phi_a_probs for pairwise computation: [B, N, 20] -> [B, N, N, 20]
-        phi_a_probs_expanded = phi_a_probs.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, 20]
+        # Expand phi_a_probs for pairwise computation: [B, N, 54] -> [B, N, N, 54]
+        phi_a_probs_expanded = phi_a_probs.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, 54]
         
-        # Weight by distances: [B, N, N, 1] * [B, N, N, 20] = [B, N, N, 20]
-        weighted_probs = pred_distances_sq.unsqueeze(-1) * phi_a_probs_expanded  # [B, N, N, 20]
+        # Weight by distances: [B, N, N, 1] * [B, N, N, 54] = [B, N, N, 54]
+        weighted_probs = pred_distances_sq.unsqueeze(-1) * phi_a_probs_expanded  # [B, N, N, 54]
         
         # Sum over j: Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
-        seq_pred = torch.sum(weighted_probs, dim=2)  # [B, N, 20]
+        seq_pred = torch.sum(weighted_probs, dim=2)  # [B, N, 54]
         
         # Apply final mask
         seq_pred = seq_pred * mol_mask.unsqueeze(-1)
