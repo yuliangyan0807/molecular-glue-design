@@ -343,15 +343,15 @@ def construct_flow_matching_dataset(
             # N coordinates
             'p1_n_coords_gt': p1_n_coords_gt,
             'p2_n_coords_gt': p2_n_coords_gt,
-            'p1_n_coords': p1_n_coords,
-            'p2_n_coords': p2_n_coords,
+            'p1_n_coords': p1_n_coords, # moved N coordinates
+            'p2_n_coords': p2_n_coords, # moved N coordinates
             # C coordinates
             'p1_c_coords_gt': p1_c_coords_gt,
             'p2_c_coords_gt': p2_c_coords_gt,
-            'p1_c_coords': p1_c_coords,
-            'p2_c_coords': p2_c_coords,
+            'p1_c_coords': p1_c_coords, # moved C coordinates
+            'p2_c_coords': p2_c_coords, # moved C coordinates
             'lig_seq': np.asarray(lig_Z, dtype=np.int32),
-            'lig_coords': np.asarray(lig_coords, dtype=np.float32),
+            'lig_coords': np.asarray(lig_coords, dtype=np.float32), # moved ligand coordinates
             'lig_coords_gt': np.asarray(lig_coords_gt, dtype=np.float32),
             'interface_flag': interface_flag,
         }

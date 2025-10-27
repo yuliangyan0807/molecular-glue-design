@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""
-Full training script for TernaryFlowModel using flow_matching_dataset_v2
-"""
 
 import os
+import sys
+import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+import torch.distributed as dist
+from torch.utils.data import DataLoader, random_split, DistributedSampler
 from datasets import load_from_disk
 import numpy as np
 import yaml
@@ -19,6 +19,49 @@ import wandb
 
 from flow_model import TernaryFlowModel
 from configs.config import DictToObject
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Train Flow Matching Model')
+    
+    # Config file
+    parser.add_argument('--config', type=str, default='configs/flow_matching_config.yaml',
+                        help='Path to config file')
+    
+    # Dataset
+    parser.add_argument('--dataset', type=str, default=None,
+                        help='Path to dataset (overrides config)')
+    parser.add_argument('--train_split', type=float, default=None,
+                        help='Training split ratio (overrides config)')
+    
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=None,
+                        help='Batch size per GPU (overrides config)')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Learning rate (overrides config)')
+    parser.add_argument('--max_iters', type=int, default=None,
+                        help='Maximum iterations (overrides config)')
+    parser.add_argument('--val_freq', type=int, default=None,
+                        help='Validation frequency (overrides config)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (overrides config)')
+    
+    # Checkpoint
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                        help='Checkpoint directory (overrides auto-generated name)')
+    
+    # Wandb
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='Wandb project name (overrides config)')
+    parser.add_argument('--wandb_name', type=str, default=None,
+                        help='Wandb run name (overrides config)')
+    parser.add_argument('--no_wandb', action='store_true',
+                        help='Disable wandb logging')
+    
+    return parser.parse_args()
 
 
 def load_config_from_yaml(config_path):
@@ -36,6 +79,58 @@ def load_config_from_yaml(config_path):
             return d
     
     return dict_to_object(config_dict)
+
+
+def apply_args_to_config(config, args, is_main_process=True):
+    """Apply command line arguments to config"""
+    if is_main_process:
+        overrides = []
+    
+    # Dataset overrides
+    if args.dataset is not None:
+        config.dataset.path = args.dataset
+        if is_main_process:
+            overrides.append(f"dataset.path = {args.dataset}")
+    
+    if args.train_split is not None:
+        config.dataset.train_split = args.train_split
+        config.dataset.val_split = 1.0 - args.train_split
+        if is_main_process:
+            overrides.append(f"train split = {args.train_split}")
+    
+    # Training parameter overrides
+    if args.batch_size is not None:
+        config.train.batch_size = args.batch_size
+        if is_main_process:
+            overrides.append(f"batch_size = {args.batch_size}")
+    
+    if args.lr is not None:
+        config.train.optimizer.lr = args.lr
+        if is_main_process:
+            overrides.append(f"learning_rate = {args.lr}")
+    
+    if args.max_iters is not None:
+        config.train.max_iters = args.max_iters
+        if is_main_process:
+            overrides.append(f"max_iters = {args.max_iters}")
+    
+    if args.val_freq is not None:
+        config.train.val_freq = args.val_freq
+        if is_main_process:
+            overrides.append(f"val_freq = {args.val_freq}")
+    
+    if args.seed is not None:
+        config.train.seed = args.seed
+        if is_main_process:
+            overrides.append(f"seed = {args.seed}")
+    
+    if is_main_process and overrides:
+        print("\n📝 Config overrides:")
+        for override in overrides:
+            print(f"   - {override}")
+        print()
+    
+    return config
 
 
 def collate_fn(batch):
@@ -105,23 +200,29 @@ def collate_fn(batch):
         batched['p2_mask'][i, len(item['p2_residue']):] = False
         batched['mol_mask'][i, len(item['lig_seq']):] = False
     
-    # Add ground truth data for loss calculation
-    batched['lig_seq_1'] = batched['lig_seq'].clone()
-    batched['lig_coords_1'] = batched['lig_coords_gt'].clone()
-    batched['R_inv_1'] = batched['R_inv'].clone()
-    batched['t_inv_1'] = batched['t_inv'].clone()
+    # Add ground truth data for loss calculation (detach to save memory)
+    batched['lig_seq_1'] = batched['lig_seq'].detach().clone()
+    batched['lig_coords_1'] = batched['lig_coords'].detach().clone()
+    batched['R_inv_1'] = batched['R_inv'].detach().clone()
+    batched['t_inv_1'] = batched['t_inv'].detach().clone()
     
     return batched
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss_dict, checkpoint_dir):
+def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss_dict, checkpoint_dir, is_ddp=False):
     """Save training checkpoint"""
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Handle DDP model
+    if is_ddp:
+        model_state_dict = model.module.state_dict()
+    else:
+        model_state_dict = model.state_dict()
     
     checkpoint = {
         'epoch': epoch,
         'global_step': global_step,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model_state_dict,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'loss_dict': loss_dict,
@@ -205,13 +306,13 @@ def create_scheduler(optimizer, config):
     return scheduler
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_step):
+def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_step, is_main_process=True):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
     loss_weights = config.train.loss_weights
     
-    progress_bar = tqdm(dataloader, desc=f"Training")
+    progress_bar = tqdm(dataloader, desc=f"Training", disable=not is_main_process)
     
     for batch_idx, batch in enumerate(progress_bar):
         # Move batch to device
@@ -274,14 +375,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_
     return avg_loss, global_step
 
 
-def validate(model, dataloader, device, config):
+def validate(model, dataloader, device, config, is_main_process=True):
     """Validate the model"""
     model.eval()
     total_loss = 0.0
     loss_weights = config.train.loss_weights
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating"):
+        for batch in tqdm(dataloader, desc="Validating", disable=not is_main_process):
             # Move batch to device
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
@@ -305,55 +406,103 @@ def validate(model, dataloader, device, config):
 
 
 def main():
-    # Setup
-    config_path = "configs/flow_matching_config.yaml"
+    # Parse command line arguments (only on main process)
+    args = parse_args()
+    
+    # Setup distributed training
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+        is_main_process = (rank == 0)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        is_main_process = True
     
     # Load configuration
-    print("Loading configuration...")
-    config = load_config_from_yaml(config_path)
-    print(f"✓ Configuration loaded from {config_path}")
+    if is_main_process:
+        print("Loading configuration...")
+    config = load_config_from_yaml(args.config)
+    if is_main_process:
+        print(f"✓ Configuration loaded from {args.config}")
+    
+    # Apply command line arguments to config
+    config = apply_args_to_config(config, args, is_main_process)
     
     # Set random seed
-    torch.manual_seed(config.train.seed)
-    np.random.seed(config.train.seed)
+    torch.manual_seed(config.train.seed + rank)
+    np.random.seed(config.train.seed + rank)
     
     # Create checkpoint directory
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    checkpoint_dir = f"checkpoints_{timestamp}"
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if args.checkpoint_dir is not None:
+        checkpoint_dir = args.checkpoint_dir
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        checkpoint_dir = f"checkpoints_{timestamp}"
     
-    # Initialize wandb
-    wandb.init(
-        project="ternary_flow",
-        name=f"train_{timestamp}",
-        config={
-            'batch_size': config.train.batch_size,
-            'lr': config.train.optimizer.lr,
-            'max_grad_norm': config.train.max_grad_norm,
-        }
-    )
+    if is_main_process:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Initialize wandb (only on main process)
+    if is_main_process and not args.no_wandb:
+        wandb_project = args.wandb_project or "ternary_flow"
+        wandb_name = args.wandb_name or f"train_{timestamp}"
+        wandb.init(
+            project=wandb_project,
+            name=wandb_name,
+            config={
+                'batch_size': config.train.batch_size,
+                'lr': config.train.optimizer.lr,
+                'max_grad_norm': config.train.max_grad_norm,
+                'world_size': world_size,
+            }
+        )
     
     # Load dataset
-    print("Loading dataset...")
+    if is_main_process:
+        print("Loading dataset...")
     try:
-        dataset = load_from_disk("flow_matching_dataset_v2")
-        print(f"✓ Dataset loaded: {len(dataset)} samples")
+        dataset_path = config.dataset.path
+        if is_main_process:
+            print(f"  Loading from: {dataset_path}")
+        dataset = load_from_disk(dataset_path)
+        if is_main_process:
+            print(f"✓ Dataset loaded: {len(dataset)} samples")
     except Exception as e:
-        print(f"✗ Failed to load dataset: {e}")
+        if is_main_process:
+            print(f"✗ Failed to load dataset: {e}")
         return
     
     # Split dataset
-    train_size = int(0.9 * len(dataset))
+    train_split = config.dataset.train_split
+    val_split = config.dataset.val_split
+    train_size = int(train_split * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    if is_main_process:
+        print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    
+    # Create distributed samplers if using multiple GPUs
+    if world_size > 1:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        train_shuffle = False  # DistributedSampler handles shuffling
+    else:
+        train_sampler = None
+        val_sampler = None
+        train_shuffle = True
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.train.batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
@@ -363,13 +512,15 @@ def main():
         val_dataset,
         batch_size=config.train.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
     )
     
     # Create model
-    print("Initializing model...")
+    if is_main_process:
+        print("Initializing model...")
     model_config = DictToObject({
         'node_embed_size': config.model.encoder.node_embed_size,
         'edge_embed_size': config.model.encoder.edge_embed_size,
@@ -382,9 +533,19 @@ def main():
     })
     
     model = TernaryFlowModel(full_config)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-    print(f"✓ Model initialized on {device}")
+    
+    # Wrap model with DDP if using multiple GPUs
+    if world_size > 1:
+        model = nn.parallel.DistributedDataParallel(
+            model, 
+            device_ids=[local_rank], 
+            output_device=local_rank,
+            find_unused_parameters=True  # Enable to handle unused parameters
+        )
+    
+    if is_main_process:
+        print(f"✓ Model initialized on {device} (world_size={world_size})")
     
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config.train)
@@ -393,67 +554,96 @@ def main():
     # Load checkpoint if exists
     start_epoch = 0
     global_step = 0
-    if os.path.exists("checkpoints_latest"):
+    
+    if args.resume is not None:
+        # Resume from specified checkpoint
+        checkpoint_path = args.resume
+    else:
+        # Try to resume from checkpoints_latest
         checkpoint_dir_old = "checkpoints_latest"
-        if os.path.exists(os.path.join(checkpoint_dir_old, "latest.pt")):
-            start_epoch, global_step = load_checkpoint(
-                model, optimizer, scheduler,
-                os.path.join(checkpoint_dir_old, "latest.pt"),
-                device
-            )
+        if os.path.exists(checkpoint_dir_old) and os.path.exists(os.path.join(checkpoint_dir_old, "latest.pt")):
+            checkpoint_path = os.path.join(checkpoint_dir_old, "latest.pt")
+        else:
+            checkpoint_path = None
+    
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        if is_main_process:
+            print(f"Resuming from checkpoint: {checkpoint_path}")
+        start_epoch, global_step = load_checkpoint(
+            model, optimizer, scheduler,
+            checkpoint_path,
+            device
+        )
     
     # Training loop
-    print("\nStarting training...")
+    if is_main_process:
+        print("\nStarting training...")
     best_val_loss = float('inf')
     
     for epoch in range(start_epoch, config.train.max_iters):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}")
-        print(f"{'='*60}")
+        # Set epoch for distributed sampler
+        if world_size > 1:
+            train_sampler.set_epoch(epoch)
+        
+        if is_main_process:
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}")
+            print(f"{'='*60}")
         
         # Train
         train_loss, global_step = train_epoch(
             model, train_loader, optimizer, scheduler,
-            device, config.train, global_step
+            device, config, global_step, is_main_process
         )
         
-        print(f"Train loss: {train_loss:.6f}")
+        if is_main_process:
+            print(f"Train loss: {train_loss:.6f}")
         
         # Validate
         if (epoch + 1) % config.train.val_freq == 0:
-            val_loss = validate(model, val_loader, device, config.train)
-            print(f"Val loss: {val_loss:.6f}")
+            val_loss = validate(model, val_loader, device, config, is_main_process)
             
-            # Save checkpoint
-            save_checkpoint(
-                model, optimizer, scheduler,
-                epoch + 1, global_step,
-                {'train_loss': train_loss, 'val_loss': val_loss},
-                checkpoint_dir
-            )
-            
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path = os.path.join(checkpoint_dir, 'best.pt')
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'val_loss': val_loss,
-                    'epoch': epoch + 1,
-                }, best_path)
-                print(f"✓ Best model saved with val_loss={val_loss:.6f}")
-            
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    'val/loss': val_loss,
-                    'epoch': epoch + 1,
-                })
+            if is_main_process:
+                print(f"Val loss: {val_loss:.6f}")
+                
+                # Save checkpoint (only on main process)
+                save_checkpoint(
+                    model, optimizer, scheduler,
+                    epoch + 1, global_step,
+                    {'train_loss': train_loss, 'val_loss': val_loss},
+                    checkpoint_dir,
+                    is_ddp=(world_size > 1)
+                )
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = os.path.join(checkpoint_dir, 'best.pt')
+                    # For DDP models, use module.state_dict()
+                    model_state_dict = model.module.state_dict() if world_size > 1 else model.state_dict()
+                    torch.save({
+                        'model_state_dict': model_state_dict,
+                        'val_loss': val_loss,
+                        'epoch': epoch + 1,
+                    }, best_path)
+                    print(f"✓ Best model saved with val_loss={val_loss:.6f}")
+                
+                # Log to wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        'val/loss': val_loss,
+                        'epoch': epoch + 1,
+                    })
     
-    print("\n✓ Training completed!")
-    wandb.finish()
+    if is_main_process:
+        print("\n✓ Training completed!")
+        if wandb.run is not None:
+            wandb.finish()
+    
+    # Clean up distributed training
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-
