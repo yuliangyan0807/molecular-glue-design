@@ -54,7 +54,7 @@ def parse_args():
                         help='Checkpoint directory (overrides auto-generated name)')
     
     # Wandb
-    parser.add_argument('--wandb_project', type=str, default=None,
+    parser.add_argument('--wandb_project', type=str, default='MGD',
                         help='Wandb project name (overrides config)')
     parser.add_argument('--wandb_name', type=str, default=None,
                         help='Wandb run name (overrides config)')
@@ -189,6 +189,11 @@ def collate_fn(batch):
     batched['R_inv'] = torch.stack([torch.tensor(item['R_inv'], dtype=torch.float32) for item in batch])
     batched['t_inv'] = torch.stack([torch.tensor(item['t_inv'], dtype=torch.float32) for item in batch])
     
+    # Handle interface_flag (for classifier-free guidance)
+    batched['interface_flag'] = torch.stack([
+        torch.tensor(item['interface_flag'], dtype=torch.bool) for item in batch
+    ])
+    
     # Create masks
     batched['p1_mask'] = torch.ones(batched['p1_residue'].shape, dtype=torch.bool)
     batched['p2_mask'] = torch.ones(batched['p2_residue'].shape, dtype=torch.bool)
@@ -304,6 +309,30 @@ def create_scheduler(optimizer, config):
         raise ValueError(f"Unknown scheduler type: {config.scheduler.type}")
     
     return scheduler
+
+
+def count_parameters(model):
+    """Count the number of trainable parameters in a model"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'non_trainable': total_params - trainable_params
+    }
+
+
+def format_number(num):
+    """Format number with appropriate unit (K, M, B)"""
+    if num >= 1e9:
+        return f"{num / 1e9:.2f}B"
+    elif num >= 1e6:
+        return f"{num / 1e6:.2f}M"
+    elif num >= 1e3:
+        return f"{num / 1e3:.2f}K"
+    else:
+        return str(num)
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_step, is_main_process=True):
@@ -524,7 +553,10 @@ def main():
     model_config = DictToObject({
         'node_embed_size': config.model.encoder.node_embed_size,
         'edge_embed_size': config.model.encoder.edge_embed_size,
-        'ipa': config.model.encoder.ipa
+        'ipa': config.model.encoder.ipa,
+        'interface_model': DictToObject({
+            'feat_dim': config.model.interface_model.feat_dim
+        })
     })
     
     full_config = DictToObject({
@@ -534,6 +566,17 @@ def main():
     
     model = TernaryFlowModel(full_config)
     model = model.to(device)
+    
+    # Count and print model parameters before DDP wrapping
+    if is_main_process:
+        param_stats = count_parameters(model)
+        print(f"\n{'='*60}")
+        print("Model Parameters:")
+        print(f"{'='*60}")
+        print(f"Total parameters:  {format_number(param_stats['total']):>10} ({param_stats['total']:,})")
+        print(f"Trainable:        {format_number(param_stats['trainable']):>10} ({param_stats['trainable']:,})")
+        print(f"Non-trainable:    {format_number(param_stats['non_trainable']):>10} ({param_stats['non_trainable']:,})")
+        print(f"{'='*60}\n")
     
     # Wrap model with DDP if using multiple GPUs
     if world_size > 1:

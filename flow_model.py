@@ -72,11 +72,39 @@ class TernaryFlowModel(nn.Module):
             lig_seq_t_prob = F.softmax(lig_seq_t_simplex, dim=-1) # (B,L,K)
             lig_seq_t = sample_from(lig_seq_t_prob) # (B,L)
 
-        # Obtain the interface guidance.
         p1_residue, p1_coords, p2_residue, p2_coords = batch['p1_residue'], batch['p1_coords'], batch['p2_residue'], batch['p2_coords']
         p1_mask, p2_mask = batch['p1_mask'], batch['p2_mask']
-        output = self.interface_model(p1_residue, p1_coords, p2_residue, p2_coords, p1_mask, p2_mask)
-        i1_repr, i2_repr = output['i1_repr'], output['i2_repr']
+
+        # Classifier-free guidance: only compute interface representations for interface_flag=True
+        interface_flag = batch['interface_flag']  # (B,) boolean tensor
+        
+        # Initialize zero representations for all samples
+        feat_dim = self._cfg.model.interface_model.feat_dim
+        i1_repr = torch.zeros(num_batch, feat_dim, device=p1_residue.device)
+        i2_repr = torch.zeros(num_batch, feat_dim, device=p1_residue.device)
+        
+        # Only compute interface representations for samples where interface_flag=True
+        if interface_flag.any():
+            # Select only samples where interface_flag=True
+            true_indices = torch.where(interface_flag)[0]
+            
+            # Extract data only for these samples
+            p1_residue_subset = p1_residue[true_indices]
+            p1_coords_subset = p1_coords[true_indices]
+            p2_residue_subset = p2_residue[true_indices]
+            p2_coords_subset = p2_coords[true_indices]
+            p1_mask_subset = p1_mask[true_indices]
+            p2_mask_subset = p2_mask[true_indices]
+            
+            # Compute interface representations only for needed samples
+            output = self.interface_model(p1_residue_subset, p1_coords_subset, 
+                                        p2_residue_subset, p2_coords_subset, 
+                                        p1_mask_subset, p2_mask_subset)
+            i1_repr_full, i2_repr_full = output['i1_repr'], output['i2_repr']
+            
+            # Fill in the representations at the correct positions in the full batch
+            i1_repr[true_indices] = i1_repr_full
+            i2_repr[true_indices] = i2_repr_full
         
         mol_mask = batch['mol_mask']
         

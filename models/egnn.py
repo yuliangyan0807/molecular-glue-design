@@ -260,6 +260,13 @@ class EGNN(nn.Module):
                 ranking.masked_fill_(self_mask, -1.)
                 ranking.masked_fill_(adj_mat, 0.)
 
+            # Dynamically adjust num_nearest based on available nodes
+            # Account for self-connections being masked out
+            # BUG
+            max_available = n - 1
+            num_nearest = min(num_nearest, max_available)
+            num_nearest = max(1, num_nearest)  # Ensure at least 1 neighbor
+            
             nbhd_ranking, nbhd_indices = ranking.topk(num_nearest, dim = -1, largest = False)
 
             nbhd_mask = nbhd_ranking <= valid_radius
