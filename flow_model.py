@@ -156,4 +156,138 @@ class TernaryFlowModel(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch):
-        pass
+        # Setup
+        num_batch = batch['lig_seq_1'].shape[0]
+        num_lig = batch['lig_seq_1'].shape[1]
+
+        # Ground truth at time step 1 (used as targets predicted by the network)
+        lig_seq_1, lig_coords_1, rotmats_1, trans_1 = batch['lig_seq_1'], batch['lig_coords_1'], batch['R_inv_1'], batch['t_inv_1']
+        lig_seq_1_simplex = self.seq_to_simplex(lig_seq_1)
+        rotmats_1 = rotmats_1.unsqueeze(1)  # (B, 1, 3, 3)
+        trans_1 = trans_1.unsqueeze(1)      # (B, 1, 3)
+
+        # Classifier-free guidance: compute interface representations only when needed
+        interface_flag = batch['interface_flag']  # (B,)
+        feat_dim = self._cfg.model.interface_model.feat_dim
+        i1_repr = torch.zeros(num_batch, feat_dim, device=lig_seq_1.device)
+        i2_repr = torch.zeros(num_batch, feat_dim, device=lig_seq_1.device)
+        if interface_flag.any():
+            true_indices = torch.where(interface_flag)[0]
+            p1_residue_subset = batch['p1_residue'][true_indices]
+            p1_coords_subset = batch['p1_coords'][true_indices]
+            p2_residue_subset = batch['p2_residue'][true_indices]
+            p2_coords_subset = batch['p2_coords'][true_indices]
+            p1_mask_subset = batch['p1_mask'][true_indices]
+            p2_mask_subset = batch['p2_mask'][true_indices]
+            output = self.interface_model(
+                p1_residue_subset, p1_coords_subset,
+                p2_residue_subset, p2_coords_subset,
+                p1_mask_subset, p2_mask_subset
+            )
+            i1_repr[true_indices] = output['i1_repr']
+            i2_repr[true_indices] = output['i2_repr']
+
+        mol_mask = batch['mol_mask']
+
+        # Time schedule
+        num_steps = getattr(self._cfg.sampling, 'num_steps', 100)
+        ts = torch.linspace(1.0e-2, 1.0, num_steps, device=lig_seq_1.device)
+        t_1 = ts[0]
+
+        # Initial noise at t ~ 0
+        rotmats_0 = uniform_so3(num_batch, 1, device=lig_seq_1.device)   # (B, 1, 3, 3)
+        trans_0 = torch.randn((num_batch, 1, 3), device=lig_seq_1.device) # (B, 1, 3)
+        lig_coords_0 = torch.randn((num_batch, num_lig, 3), device=lig_seq_1.device)  # (B, L, 3)
+        lig_seq_0_simplex = self.k * torch.randn_like(lig_seq_1_simplex)  # (B, L, K)
+        lig_seq_0_prob = F.softmax(lig_seq_0_simplex, dim=-1)
+        lig_seq_0 = sample_from(lig_seq_0_prob)  # (B, L)
+
+        # States at current time step t_1
+        rotmats_t_1 = rotmats_0
+        trans_t_1 = trans_0
+        lig_coords_t_1 = lig_coords_0
+        lig_seq_t_1 = lig_seq_0
+        lig_seq_t_1_simplex = lig_seq_0_simplex
+
+        clean_traj = []
+
+        # Denoise loop
+        for t_2 in ts[1:]:
+            t = torch.ones((num_batch, 1), device=lig_seq_1.device) * t_1
+
+            # Predict raw data at time step 1 given the current noisy state at time t
+            pred_lig_seq_1_prob, pred_lig_coords_1, pred_rotmats_1, pred_trans_1 = self.vf_model(
+                t=t,
+                lig_coords_t=lig_coords_t_1,
+                rotmats_t=rotmats_t_1,
+                trans_t=trans_t_1,
+                lig_seq_t=lig_seq_t_1,
+                p1_coords=batch['p1_coords'], p1_c_coords=batch['p1_c_coords'], p1_n_coords=batch['p1_n_coords'], p1_seq=batch['p1_residue'], p1_mask=batch['p1_mask'],
+                p2_coords=batch['p2_coords'], p2_c_coords=batch['p2_c_coords'], p2_n_coords=batch['p2_n_coords'], p2_seq=batch['p2_residue'], p2_mask=batch['p2_mask'],
+                mol_mask=mol_mask, i1_repr=i1_repr, i2_repr=i2_repr
+            )
+
+            pred_lig_seq_1 = sample_from(F.softmax(pred_lig_seq_1_prob, dim=-1))
+            pred_lig_seq_1_simplex = self.seq_to_simplex(pred_lig_seq_1)
+
+            # Record trajectory (CPU for memory safety downstream)
+            clean_traj.append({
+                'rotmats': pred_rotmats_1.detach().cpu(),
+                'trans': pred_trans_1.detach().cpu(),
+                'lig_coords': pred_lig_coords_1.detach().cpu(),
+                'lig_seq': pred_lig_seq_1.detach().cpu(),
+                'lig_seq_simplex': pred_lig_seq_1_simplex.detach().cpu(),
+                'rotmats_1': rotmats_1.detach().cpu(),
+                'trans_1': trans_1.detach().cpu(),
+                'lig_coords_1': lig_coords_1.detach().cpu(),
+                'lig_seq_1': lig_seq_1.detach().cpu(),
+            })
+
+            # Euler step along the flow from t_1 to t_2
+            d_t = (t_2 - t_1) * torch.ones((num_batch, 1), device=lig_seq_1.device)
+
+            # Translation and coordinates (Euclidean)
+            trans_t_2 = trans_t_1 + (pred_trans_1 - trans_0) * d_t[..., None]
+            lig_coords_t_2 = lig_coords_t_1 + (pred_lig_coords_1 - lig_coords_0) * d_t[..., None]
+
+            # Rotation (SO(3) geodesic step)
+            rotmats_t_2 = geodesic_t(d_t[..., None], pred_rotmats_1, rotmats_t_1)
+
+            # Sequences (simplex)
+            lig_seq_t_2_simplex = lig_seq_t_1_simplex + (pred_lig_seq_1_simplex - lig_seq_0_simplex) * d_t[..., None]
+            lig_seq_t_2 = sample_from(F.softmax(lig_seq_t_2_simplex, dim=-1))
+
+            # Move to next step
+            rotmats_t_1, trans_t_1, lig_coords_t_1, lig_seq_t_1, lig_seq_t_1_simplex = (
+                rotmats_t_2, trans_t_2, lig_coords_t_2, lig_seq_t_2, lig_seq_t_2_simplex
+            )
+            t_1 = t_2
+
+        # Final step at t=1
+        t = torch.ones((num_batch, 1), device=lig_seq_1.device) * ts[-1]
+        pred_lig_seq_1_prob, pred_lig_coords_1, pred_rotmats_1, pred_trans_1 = self.vf_model(
+            t=t,
+            lig_coords_t=lig_coords_t_1,
+            rotmats_t=rotmats_t_1,
+            trans_t=trans_t_1,
+            lig_seq_t=lig_seq_t_1,
+            p1_coords=batch['p1_coords'], p1_c_coords=batch['p1_c_coords'], p1_n_coords=batch['p1_n_coords'], p1_seq=batch['p1_residue'], p1_mask=batch['p1_mask'],
+            p2_coords=batch['p2_coords'], p2_c_coords=batch['p2_c_coords'], p2_n_coords=batch['p2_n_coords'], p2_seq=batch['p2_residue'], p2_mask=batch['p2_mask'],
+            mol_mask=mol_mask, i1_repr=i1_repr, i2_repr=i2_repr
+        )
+        pred_lig_seq_1 = sample_from(F.softmax(pred_lig_seq_1_prob, dim=-1))
+        pred_lig_seq_1_simplex = self.seq_to_simplex(pred_lig_seq_1)
+
+        clean_traj.append({
+            'rotmats': pred_rotmats_1.detach().cpu(),
+            'trans': pred_trans_1.detach().cpu(),
+            'lig_coords': pred_lig_coords_1.detach().cpu(),
+            'lig_seq': pred_lig_seq_1.detach().cpu(),
+            'lig_seq_simplex': pred_lig_seq_1_simplex.detach().cpu(),
+            'rotmats_1': rotmats_1.detach().cpu(),
+            'trans_1': trans_1.detach().cpu(),
+            'lig_coords_1': lig_coords_1.detach().cpu(),
+            'lig_seq_1': lig_seq_1.detach().cpu(),
+        })
+
+        return clean_traj
