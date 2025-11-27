@@ -621,9 +621,24 @@ def main():
     # Training loop
     if is_main_process:
         print("\nStarting training...")
+    
+    # Calculate total epochs from max_iters
+    # max_iters is total iterations, convert to epochs
+    dataset_size = len(train_dataset)
+    batch_size = config.train.batch_size
+    iterations_per_epoch = (dataset_size + batch_size - 1) // batch_size  # ceil division
+    total_epochs = config.train.max_iters // iterations_per_epoch
+    
+    if is_main_process:
+        print(f"Dataset size: {dataset_size} samples")
+        print(f"Batch size: {batch_size}")
+        print(f"Iterations per epoch: {iterations_per_epoch}")
+        print(f"Total epochs: {total_epochs}")
+        print(f"Total iterations: {config.train.max_iters}")
+    
     best_val_loss = float('inf')
     
-    for epoch in range(start_epoch, config.train.max_iters):
+    for epoch in range(start_epoch, total_epochs):
         # Set epoch for distributed sampler
         if world_size > 1:
             train_sampler.set_epoch(epoch)

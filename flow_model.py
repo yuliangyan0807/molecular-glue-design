@@ -196,15 +196,15 @@ class TernaryFlowModel(nn.Module):
 
         # Initial noise at t ~ 0
         rotmats_0 = uniform_so3(num_batch, 1, device=lig_seq_1.device)   # (B, 1, 3, 3)
-        trans_0 = torch.randn((num_batch, 1, 3), device=lig_seq_1.device) # (B, 1, 3)
+        trans_0 = torch.randn((num_batch, 3), device=lig_seq_1.device) # (B, 3)
         lig_coords_0 = torch.randn((num_batch, num_lig, 3), device=lig_seq_1.device)  # (B, L, 3)
         lig_seq_0_simplex = self.k * torch.randn_like(lig_seq_1_simplex)  # (B, L, K)
         lig_seq_0_prob = F.softmax(lig_seq_0_simplex, dim=-1)
         lig_seq_0 = sample_from(lig_seq_0_prob)  # (B, L)
 
         # States at current time step t_1
-        rotmats_t_1 = rotmats_0
-        trans_t_1 = trans_0
+        rotmats_t_1 = rotmats_0.squeeze(1) # (B, 3, 3)
+        trans_t_1 = trans_0 # (B, 3)
         lig_coords_t_1 = lig_coords_0
         lig_seq_t_1 = lig_seq_0
         lig_seq_t_1_simplex = lig_seq_0_simplex
@@ -244,14 +244,18 @@ class TernaryFlowModel(nn.Module):
             })
 
             # Euler step along the flow from t_1 to t_2
-            d_t = (t_2 - t_1) * torch.ones((num_batch, 1), device=lig_seq_1.device)
+            d_t = (t_2 - t_1) * torch.ones((num_batch, 1), device=lig_seq_1.device)  # (B, 1)
 
             # Translation and coordinates (Euclidean)
-            trans_t_2 = trans_t_1 + (pred_trans_1 - trans_0) * d_t[..., None]
-            lig_coords_t_2 = lig_coords_t_1 + (pred_lig_coords_1 - lig_coords_0) * d_t[..., None]
+            # trans_t_1: (B, 3), pred_trans_1: (B, 3), trans_0: (B, 3), d_t: (B, 1)
+            # (B, 3) * (B, 1) broadcasts to (B, 3)
+            trans_t_2 = trans_t_1 + (pred_trans_1 - trans_0) * d_t  # (B, 3)
+            lig_coords_t_2 = lig_coords_t_1 + (pred_lig_coords_1 - lig_coords_0) * d_t[..., None]  # (B, L, 3) * (B, 1, 1) -> (B, L, 3)
 
             # Rotation (SO(3) geodesic step)
-            rotmats_t_2 = geodesic_t(d_t[..., None], pred_rotmats_1, rotmats_t_1)
+            # geodesic_t expects: t [B,1,1], mat [B,L,3,3], base_mat [B,L,3,3]
+            rotmats_t_2 = geodesic_t(d_t[..., None], pred_rotmats_1.unsqueeze(1), rotmats_t_1.unsqueeze(1))
+            rotmats_t_2 = rotmats_t_2.squeeze(1)  # (B, 1, 3, 3) -> (B, 3, 3) to match rotmats_t_1 shape
 
             # Sequences (simplex)
             lig_seq_t_2_simplex = lig_seq_t_1_simplex + (pred_lig_seq_1_simplex - lig_seq_0_simplex) * d_t[..., None]
