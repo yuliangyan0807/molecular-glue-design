@@ -11,6 +11,7 @@ from datasets import load_from_disk
 import numpy as np
 import yaml
 import time
+import random
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
@@ -19,7 +20,24 @@ import wandb
 
 from flow_model import TernaryFlowModel
 from configs.config import DictToObject
-
+from utils.training_utils import (
+    collate_fn,
+    save_checkpoint,
+    load_checkpoint,
+    create_optimizer,
+    create_scheduler,
+    count_parameters,
+    format_number,
+    compute_rmsd,
+    compute_translation_error,
+    compute_rotation_error,
+    compute_sequence_accuracy,
+    format_sequence,
+    format_coords,
+    format_translation,
+    format_rotation,
+)
+from sampling import *
 
 def parse_args():
     """Parse command line arguments"""
@@ -40,10 +58,10 @@ def parse_args():
                         help='Batch size per GPU (overrides config)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Learning rate (overrides config)')
-    parser.add_argument('--max_iters', type=int, default=None,
-                        help='Maximum iterations (overrides config)')
+    parser.add_argument('--max_epochs', type=int, default=None,
+                        help='Maximum epochs (overrides config)')
     parser.add_argument('--val_freq', type=int, default=None,
-                        help='Validation frequency (overrides config)')
+                        help='Validation frequency in epochs (overrides config)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed (overrides config)')
     
@@ -109,15 +127,20 @@ def apply_args_to_config(config, args, is_main_process=True):
         if is_main_process:
             overrides.append(f"learning_rate = {args.lr}")
     
-    if args.max_iters is not None:
-        config.train.max_iters = args.max_iters
+    if args.max_epochs is not None:
+        config.train.max_epochs = args.max_epochs
         if is_main_process:
-            overrides.append(f"max_iters = {args.max_iters}")
+            overrides.append(f"max_epochs = {args.max_epochs}")
     
     if args.val_freq is not None:
         config.train.val_freq = args.val_freq
         if is_main_process:
             overrides.append(f"val_freq = {args.val_freq}")
+    
+    if hasattr(args, 'save_freq') and args.save_freq is not None:
+        config.train.save_freq = args.save_freq
+        if is_main_process:
+            overrides.append(f"save_freq = {args.save_freq}")
     
     if args.seed is not None:
         config.train.seed = args.seed
@@ -133,212 +156,14 @@ def apply_args_to_config(config, args, is_main_process=True):
     return config
 
 
-def collate_fn(batch):
-    """Collate function for batching"""
-    # Get the maximum lengths for padding
-    max_p1_len = max([len(item['p1_residue']) for item in batch])
-    max_p2_len = max([len(item['p2_residue']) for item in batch])
-    max_lig_len = max([len(item['lig_seq']) for item in batch])
-    
-    # Pad sequences and coordinates
-    batched = {}
-    
-    # Pad sequences
-    for key in ['p1_residue', 'p2_residue', 'lig_seq']:
-        batched[key] = []
-        for item in batch:
-            seq = torch.tensor(item[key], dtype=torch.long)
-            if key == 'p1_residue':
-                padded = torch.nn.functional.pad(seq, (0, max_p1_len - len(seq)), value=20)
-            elif key == 'p2_residue':
-                padded = torch.nn.functional.pad(seq, (0, max_p2_len - len(seq)), value=20)
-            else:  # lig_seq
-                padded = torch.nn.functional.pad(seq, (0, max_lig_len - len(seq)), value=0)
-            batched[key].append(padded)
-        batched[key] = torch.stack(batched[key])
-    
-    # Pad coordinates
-    for key in ['p1_coords', 'p2_coords', 'p1_n_coords', 'p2_n_coords', 'p1_c_coords', 'p2_c_coords']:
-        batched[key] = []
-        for item in batch:
-            coords = torch.tensor(item[key], dtype=torch.float32)
-            if 'p1' in key:
-                padded = torch.nn.functional.pad(coords, (0, 0, 0, max_p1_len - coords.shape[0]), value=0)
-            else:  # p2
-                padded = torch.nn.functional.pad(coords, (0, 0, 0, max_p2_len - coords.shape[0]), value=0)
-            batched[key].append(padded)
-        batched[key] = torch.stack(batched[key])
-    
-    # Pad ligand coordinates
-    batched['lig_coords'] = []
-    for item in batch:
-        coords = torch.tensor(item['lig_coords'], dtype=torch.float32)
-        padded = torch.nn.functional.pad(coords, (0, 0, 0, max_lig_len - coords.shape[0]), value=0)
-        batched['lig_coords'].append(padded)
-    batched['lig_coords'] = torch.stack(batched['lig_coords'])
-    
-    # Pad ligand ground truth coordinates
-    batched['lig_coords_gt'] = []
-    for item in batch:
-        coords = torch.tensor(item['lig_coords_gt'], dtype=torch.float32)
-        padded = torch.nn.functional.pad(coords, (0, 0, 0, max_lig_len - coords.shape[0]), value=0)
-        batched['lig_coords_gt'].append(padded)
-    batched['lig_coords_gt'] = torch.stack(batched['lig_coords_gt'])
-    
-    # Handle R_inv and t_inv
-    batched['R_inv'] = torch.stack([torch.tensor(item['R_inv'], dtype=torch.float32) for item in batch])
-    batched['t_inv'] = torch.stack([torch.tensor(item['t_inv'], dtype=torch.float32) for item in batch])
-    
-    # Handle interface_flag (for classifier-free guidance)
-    batched['interface_flag'] = torch.stack([
-        torch.tensor(item['interface_flag'], dtype=torch.bool) for item in batch
-    ])
-    
-    # Create masks
-    batched['p1_mask'] = torch.ones(batched['p1_residue'].shape, dtype=torch.bool)
-    batched['p2_mask'] = torch.ones(batched['p2_residue'].shape, dtype=torch.bool)
-    batched['mol_mask'] = torch.ones(batched['lig_seq'].shape, dtype=torch.bool)
-    
-    # Set padding positions to False in masks
-    for i, item in enumerate(batch):
-        batched['p1_mask'][i, len(item['p1_residue']):] = False
-        batched['p2_mask'][i, len(item['p2_residue']):] = False
-        batched['mol_mask'][i, len(item['lig_seq']):] = False
-    
-    # Add ground truth data for loss calculation (detach to save memory)
-    batched['lig_seq_1'] = batched['lig_seq'].detach().clone()
-    batched['lig_coords_1'] = batched['lig_coords'].detach().clone()
-    batched['R_inv_1'] = batched['R_inv'].detach().clone()
-    batched['t_inv_1'] = batched['t_inv'].detach().clone()
-    
-    return batched
-
-
-def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss_dict, checkpoint_dir, is_ddp=False):
-    """Save training checkpoint"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Handle DDP model
-    if is_ddp:
-        model_state_dict = model.module.state_dict()
-    else:
-        model_state_dict = model.state_dict()
-    
-    checkpoint = {
-        'epoch': epoch,
-        'global_step': global_step,
-        'model_state_dict': model_state_dict,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-        'loss_dict': loss_dict,
-    }
-    
-    # Save latest checkpoint
-    latest_path = os.path.join(checkpoint_dir, 'latest.pt')
-    torch.save(checkpoint, latest_path)
-    
-    # Save epoch checkpoint
-    epoch_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-    torch.save(checkpoint, epoch_path)
-    
-    print(f"✓ Checkpoint saved: {epoch_path}")
-
-
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
-    """Load training checkpoint"""
-    if not os.path.exists(checkpoint_path):
-        print(f"Checkpoint not found: {checkpoint_path}")
-        return 0
-    
-    print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    epoch = checkpoint.get('epoch', 0)
-    global_step = checkpoint.get('global_step', 0)
-    
-    print(f"✓ Checkpoint loaded: epoch={epoch}, global_step={global_step}")
-    
-    return epoch, global_step
-
-
-def create_optimizer(model, config):
-    """Create optimizer based on config"""
-    if config.optimizer.type == 'adam':
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config.optimizer.lr,
-            weight_decay=config.optimizer.weight_decay,
-            betas=(config.optimizer.beta1, config.optimizer.beta2)
-        )
-    elif config.optimizer.type == 'adamw':
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.optimizer.lr,
-            weight_decay=config.optimizer.weight_decay
-        )
-    else:
-        raise ValueError(f"Unknown optimizer type: {config.optimizer.type}")
-    
-    return optimizer
-
-
-def create_scheduler(optimizer, config):
-    """Create learning rate scheduler based on config"""
-    if config.scheduler.type == 'plateau':
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=config.scheduler.factor,
-            patience=config.scheduler.patience,
-            min_lr=config.scheduler.min_lr,
-            verbose=True
-        )
-    elif config.scheduler.type == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=config.max_iters
-        )
-    elif config.scheduler.type == 'none':
-        scheduler = None
-    else:
-        raise ValueError(f"Unknown scheduler type: {config.scheduler.type}")
-    
-    return scheduler
-
-
-def count_parameters(model):
-    """Count the number of trainable parameters in a model"""
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    return {
-        'total': total_params,
-        'trainable': trainable_params,
-        'non_trainable': total_params - trainable_params
-    }
-
-
-def format_number(num):
-    """Format number with appropriate unit (K, M, B)"""
-    if num >= 1e9:
-        return f"{num / 1e9:.2f}B"
-    elif num >= 1e6:
-        return f"{num / 1e6:.2f}M"
-    elif num >= 1e3:
-        return f"{num / 1e3:.2f}K"
-    else:
-        return str(num)
-
-
 def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_step, is_main_process=True):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
+    total_trans_loss = 0.0
+    total_rot_loss = 0.0
+    total_seqs_loss = 0.0
+    total_coords_loss = 0.0
     loss_weights = config.train.loss_weights
     
     progress_bar = tqdm(dataloader, desc=f"Training", disable=not is_main_process)
@@ -372,7 +197,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_
             'coord': f"{loss_dict['coords_loss'].item():.4f}",
         })
         
+        # Accumulate losses for epoch average
         total_loss += total_batch_loss.item()
+        total_trans_loss += loss_dict['trans_loss'].item()
+        total_rot_loss += loss_dict['rot_loss'].item()
+        total_seqs_loss += loss_dict['seqs_loss'].item()
+        total_coords_loss += loss_dict['coords_loss'].item()
+        
         global_step += 1
         
         # Optimizer step (with gradient accumulation)
@@ -384,54 +215,160 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, config, global_
             optimizer.step()
             optimizer.zero_grad()
             
-            # Update learning rate scheduler
+            # Update learning rate scheduler (for non-plateau schedulers, step is called per epoch)
             if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(total_loss / (batch_idx + 1))
-        
-        # Log to wandb
-        if wandb.run is not None:
-            wandb.log({
-                'train/loss': total_batch_loss.item(),
-                'train/trans_loss': loss_dict['trans_loss'].item(),
-                'train/rot_loss': loss_dict['rot_loss'].item(),
-                'train/seqs_loss': loss_dict['seqs_loss'].item(),
-                'train/coords_loss': loss_dict['coords_loss'].item(),
-                'train/lr': optimizer.param_groups[0]['lr'],
-                'global_step': global_step,
-            })
     
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss, global_step
+    # Compute epoch averages
+    num_batches = len(dataloader)
+    avg_loss = total_loss / num_batches
+    avg_trans_loss = total_trans_loss / num_batches
+    avg_rot_loss = total_rot_loss / num_batches
+    avg_seqs_loss = total_seqs_loss / num_batches
+    avg_coords_loss = total_coords_loss / num_batches
+    
+    return {
+        'avg_loss': avg_loss,
+        'avg_trans_loss': avg_trans_loss,
+        'avg_rot_loss': avg_rot_loss,
+        'avg_seqs_loss': avg_seqs_loss,
+        'avg_coords_loss': avg_coords_loss,
+    }, global_step
 
 
-def validate(model, dataloader, device, config, is_main_process=True):
-    """Validate the model"""
+def validate(model, val_dataset, device, config, is_main_process=True, is_ddp=False):
+    """
+    Validate the model by sampling and comparing with ground truth.
+    
+    Args:
+        model: The model to validate (may be wrapped in DDP)
+        val_dataset: Validation dataset (not DataLoader)
+        device: Device to run on
+        config: Configuration object
+        is_main_process: Whether this is the main process (for distributed training)
+        is_ddp: Whether model is wrapped in DistributedDataParallel
+    
+    Returns:
+        metrics_dict: Dictionary containing validation metrics
+    """
     model.eval()
-    total_loss = 0.0
-    loss_weights = config.train.loss_weights
+    
+    # Get the actual model (unwrap DDP if needed)
+    actual_model = model.module if is_ddp else model
+    
+    # Number of samples to validate on
+    num_val_samples = getattr(config.train, 'num_val_samples', 50)
+    num_val_samples = min(num_val_samples, len(val_dataset))
+    
+    # Randomly select samples from validation set
+    val_indices = random.sample(range(len(val_dataset)), num_val_samples)
+    
+    # Initialize metrics accumulators
+    all_rmsd = []
+    all_trans_error = []
+    all_rot_error = []
+    all_seq_acc = []
+    
+    if is_main_process:
+        print(f"Validating on {num_val_samples} samples...")
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating", disable=not is_main_process):
-            # Move batch to device
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
-            
-            # Forward pass
-            loss_dict = model(batch)
-            
-            # Compute weighted total loss
-            total_batch_loss = (
-                loss_weights.trans_loss * loss_dict['trans_loss'] +
-                loss_weights.rot_loss * loss_dict['rot_loss'] +
-                loss_weights.seqs_loss * loss_dict['seqs_loss'] +
-                loss_weights.coords_loss * loss_dict['coords_loss']
-            )
-            
-            total_loss += total_batch_loss.item()
+        for sample_idx, idx in enumerate(tqdm(val_indices, desc="Validating", disable=not is_main_process)):
+            try:
+                # Get sample from dataset
+                item = val_dataset[idx]
+                
+                # Create batch (single sample)
+                batch_items = [item]
+                batch = collate_fn(batch_items)
+                
+                # Move batch to device
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device)
+                
+                # Sample from model (use actual_model to handle DDP wrapping)
+                traj = actual_model.sample(batch)
+                final_sample = traj[-1]  # Get final sample
+                
+                # Extract predictions and ground truth (batch size = 1, so index 0)
+                lig_coords_pred = final_sample['lig_coords'][0]  # (L, 3)
+                lig_coords_gt = batch['lig_coords_1'][0]  # (L, 3)
+                mol_mask = batch['mol_mask'][0]  # (L,)
+                
+                trans_pred = final_sample['trans'][0]  # (3,)
+                trans_gt = batch['t_inv_1'][0]  # (3,)
+                
+                rot_pred = final_sample['rotmats'][0]  # (3, 3)
+                rot_gt = batch['R_inv_1'][0]  # (3, 3)
+                
+                lig_seq_pred = final_sample['lig_seq'][0]  # (L,)
+                lig_seq_gt = batch['lig_seq_1'][0]  # (L,)
+                
+                # Compute metrics for this sample
+                # RMSD for coordinates
+                rmsd = compute_rmsd(lig_coords_pred.unsqueeze(0), lig_coords_gt.unsqueeze(0), mol_mask.unsqueeze(0))
+                all_rmsd.append(rmsd.item())
+                
+                # Translation error
+                trans_error = compute_translation_error(trans_pred.unsqueeze(0), trans_gt.unsqueeze(0))
+                all_trans_error.append(trans_error.item())
+                
+                # Rotation error
+                rot_error = compute_rotation_error(rot_pred.unsqueeze(0), rot_gt.unsqueeze(0))
+                all_rot_error.append(rot_error.item())
+                
+                # Sequence accuracy
+                seq_acc = compute_sequence_accuracy(lig_seq_pred.unsqueeze(0), lig_seq_gt.unsqueeze(0), mol_mask.unsqueeze(0))
+                all_seq_acc.append(seq_acc.item())
+                
+                # Print comparison for this sample
+                if is_main_process:
+                    print(f"\n{'='*80}")
+                    print(f"Sample {sample_idx + 1}/{num_val_samples} (Dataset index: {idx})")
+                    print(f"{'='*80}")
+                    print(f"\n📊 Metrics:")
+                    print(f"  RMSD: {rmsd.item():.4f} Å")
+                    print(f"  Translation error: {trans_error.item():.4f} Å")
+                    print(f"  Rotation error: {rot_error.item():.4f}")
+                    print(f"  Sequence accuracy: {seq_acc.item():.4f} ({seq_acc.item()*100:.2f}%)")
+                    
+                    print(f"\n🧬 Sequence Comparison:")
+                    print(f"  Predicted: {format_sequence(lig_seq_pred, mol_mask)}")
+                    print(f"  Ground Truth: {format_sequence(lig_seq_gt, mol_mask)}")
+                    
+                    print(f"\n📍 Translation Comparison:")
+                    print(f"  Predicted: {format_translation(trans_pred)}")
+                    print(f"  Ground Truth: {format_translation(trans_gt)}")
+                    print(f"  Error: {trans_error.item():.4f} Å")
+                    
+                    print(f"\n🔄 Rotation Matrix Comparison:")
+                    print(f"  Predicted:\n{format_rotation(rot_pred)}")
+                    print(f"  Ground Truth:\n{format_rotation(rot_gt)}")
+                    print(f"  Rotation error: {rot_error.item():.4f}")
+                    
+                    print(f"\n📐 Coordinates Comparison (first few atoms):")
+                    print(f"  Predicted:\n{format_coords(lig_coords_pred, mol_mask)}")
+                    print(f"  Ground Truth:\n{format_coords(lig_coords_gt, mol_mask)}")
+                    print(f"  RMSD: {rmsd.item():.4f} Å")
+                    print(f"{'='*80}\n")
+                
+            except Exception as e:
+                if is_main_process:
+                    print(f"Warning: Error validating sample {idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                continue
     
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    # Compute average metrics
+    metrics = {
+        'rmsd': np.mean(all_rmsd) if all_rmsd else 0.0,
+        'trans_error': np.mean(all_trans_error) if all_trans_error else 0.0,
+        'rot_error': np.mean(all_rot_error) if all_rot_error else 0.0,
+        'seq_acc': np.mean(all_seq_acc) if all_seq_acc else 0.0,
+    }
+    
+    return metrics
 
 
 def main():
@@ -487,6 +424,8 @@ def main():
                 'batch_size': config.train.batch_size,
                 'lr': config.train.optimizer.lr,
                 'max_grad_norm': config.train.max_grad_norm,
+                'max_epochs': config.train.max_epochs,
+                'val_freq': config.train.val_freq,
                 'world_size': world_size,
             }
         )
@@ -559,9 +498,21 @@ def main():
         })
     })
     
+    # Get sampling config from interpolant or create default
+    if hasattr(config.model.interpolant, 'sampling'):
+        sampling_config = config.model.interpolant.sampling
+        # Convert num_timesteps to num_steps if needed
+        if hasattr(sampling_config, 'num_timesteps'):
+            sampling_config = DictToObject({'num_steps': sampling_config.num_timesteps})
+        else:
+            sampling_config = DictToObject({'num_steps': getattr(sampling_config, 'num_steps', 100)})
+    else:
+        sampling_config = DictToObject({'num_steps': 100})
+    
     full_config = DictToObject({
         'model': model_config,
-        'interpolant': config.model.interpolant
+        'interpolant': config.model.interpolant,
+        'sampling': sampling_config
     })
     
     model = TernaryFlowModel(full_config)
@@ -622,23 +573,22 @@ def main():
     if is_main_process:
         print("\nStarting training...")
     
-    # Calculate total epochs from max_iters
-    # max_iters is total iterations, convert to epochs
+    # Get training configuration
+    max_epochs = config.train.max_epochs
     dataset_size = len(train_dataset)
     batch_size = config.train.batch_size
     iterations_per_epoch = (dataset_size + batch_size - 1) // batch_size  # ceil division
-    total_epochs = config.train.max_iters // iterations_per_epoch
     
     if is_main_process:
         print(f"Dataset size: {dataset_size} samples")
         print(f"Batch size: {batch_size}")
         print(f"Iterations per epoch: {iterations_per_epoch}")
-        print(f"Total epochs: {total_epochs}")
-        print(f"Total iterations: {config.train.max_iters}")
+        print(f"Total epochs: {max_epochs}")
+        print(f"Validation frequency: every {config.train.val_freq} epoch(s)")
     
-    best_val_loss = float('inf')
+    best_val_rmsd = float('inf')  # Track best RMSD (lower is better)
     
-    for epoch in range(start_epoch, total_epochs):
+    for epoch in range(start_epoch, max_epochs):
         # Set epoch for distributed sampler
         if world_size > 1:
             train_sampler.set_epoch(epoch)
@@ -649,49 +599,91 @@ def main():
             print(f"{'='*60}")
         
         # Train
-        train_loss, global_step = train_epoch(
+        train_metrics, global_step = train_epoch(
             model, train_loader, optimizer, scheduler,
             device, config, global_step, is_main_process
         )
         
         if is_main_process:
-            print(f"Train loss: {train_loss:.6f}")
+            print(f"Train loss: {train_metrics['avg_loss']:.6f}")
+            
+            # Log to wandb at epoch level
+            if wandb.run is not None:
+                wandb.log({
+                    'train/loss': train_metrics['avg_loss'],
+                    'train/trans_loss': train_metrics['avg_trans_loss'],
+                    'train/rot_loss': train_metrics['avg_rot_loss'],
+                    'train/seqs_loss': train_metrics['avg_seqs_loss'],
+                    'train/coords_loss': train_metrics['avg_coords_loss'],
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                })
+        
+        # Update learning rate scheduler (for non-plateau schedulers)
+        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step()
         
         # Validate
+        val_metrics = None
         if (epoch + 1) % config.train.val_freq == 0:
-            val_loss = validate(model, val_loader, device, config, is_main_process)
+            val_metrics = validate(model, val_dataset, device, config, is_main_process, is_ddp=(world_size > 1))
             
             if is_main_process:
-                print(f"Val loss: {val_loss:.6f}")
+                print(f"Validation metrics:")
+                print(f"  RMSD: {val_metrics['rmsd']:.4f} Å")
+                print(f"  Translation error: {val_metrics['trans_error']:.4f} Å")
+                print(f"  Rotation error: {val_metrics['rot_error']:.4f}")
+                print(f"  Sequence accuracy: {val_metrics['seq_acc']:.4f}")
                 
-                # Save checkpoint (only on main process)
-                save_checkpoint(
-                    model, optimizer, scheduler,
-                    epoch + 1, global_step,
-                    {'train_loss': train_loss, 'val_loss': val_loss},
-                    checkpoint_dir,
-                    is_ddp=(world_size > 1)
-                )
+                # Use RMSD as the main metric for model selection
+                val_rmsd = val_metrics['rmsd']
                 
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                # Save best model (based on RMSD - lower is better)
+                if val_rmsd < best_val_rmsd:
+                    best_val_rmsd = val_rmsd
                     best_path = os.path.join(checkpoint_dir, 'best.pt')
                     # For DDP models, use module.state_dict()
                     model_state_dict = model.module.state_dict() if world_size > 1 else model.state_dict()
                     torch.save({
                         'model_state_dict': model_state_dict,
-                        'val_loss': val_loss,
+                        'val_metrics': val_metrics,
                         'epoch': epoch + 1,
                     }, best_path)
-                    print(f"✓ Best model saved with val_loss={val_loss:.6f}")
+                    print(f"✓ Best model saved with RMSD={val_rmsd:.4f} Å")
                 
                 # Log to wandb
                 if wandb.run is not None:
                     wandb.log({
-                        'val/loss': val_loss,
+                        'val/rmsd': val_metrics['rmsd'],
+                        'val/trans_error': val_metrics['trans_error'],
+                        'val/rot_error': val_metrics['rot_error'],
+                        'val/seq_acc': val_metrics['seq_acc'],
                         'epoch': epoch + 1,
                     })
+        
+        # Save checkpoint at fixed intervals or at last epoch
+        save_freq = getattr(config.train, 'save_freq', 1)
+        is_last_epoch = (epoch + 1 == max_epochs)
+        should_save = (epoch + 1) % save_freq == 0 or is_last_epoch
+        
+        if is_main_process and should_save:
+            # Prepare metrics dict
+            metrics_dict = {'train_metrics': train_metrics}
+            if val_metrics is not None:
+                metrics_dict['val_metrics'] = val_metrics
+            
+            # Save checkpoint
+            save_checkpoint(
+                model, optimizer, scheduler,
+                epoch + 1, global_step,
+                metrics_dict,
+                checkpoint_dir,
+                is_ddp=(world_size > 1)
+            )
+            
+            if is_last_epoch:
+                print(f"✓ Final epoch checkpoint saved")
     
     if is_main_process:
         print("\n✓ Training completed!")
