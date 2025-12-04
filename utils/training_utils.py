@@ -2,10 +2,10 @@
 
 import os
 import torch
-import torch.nn as nn
 import numpy as np
 from utils.so3_utils import geodesic_dist
-
+from configs.config import DictToObject
+import yaml
 
 def collate_fn(batch):
     """Collate function for batching"""
@@ -86,6 +86,140 @@ def collate_fn(batch):
     batched['t_inv_1'] = batched['t_inv'].detach().clone()
     
     return batched
+
+
+def load_config_from_yaml(config_path):
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    
+    # Convert to DictToObject recursively
+    def dict_to_object(d):
+        if isinstance(d, dict):
+            return DictToObject({k: dict_to_object(v) for k, v in d.items()})
+        elif isinstance(d, list):
+            return [dict_to_object(item) for item in d]
+        else:
+            return d
+    
+    return dict_to_object(config_dict)
+
+
+def apply_args_to_config(config, args, is_main_process=True):
+    """Apply command line arguments to config"""
+    if is_main_process:
+        overrides = []
+    
+    # Dataset overrides
+    if args.dataset is not None:
+        config.dataset.path = args.dataset
+        if is_main_process:
+            overrides.append(f"dataset.path = {args.dataset}")
+    
+    if args.train_split is not None:
+        config.dataset.train_split = args.train_split
+        config.dataset.val_split = 1.0 - args.train_split
+        if is_main_process:
+            overrides.append(f"train split = {args.train_split}")
+    
+    # Training parameter overrides
+    if args.batch_size is not None:
+        config.train.batch_size = args.batch_size
+        if is_main_process:
+            overrides.append(f"batch_size = {args.batch_size}")
+    
+    if args.lr is not None:
+        config.train.optimizer.lr = args.lr
+        if is_main_process:
+            overrides.append(f"learning_rate = {args.lr}")
+    
+    if args.max_epochs is not None:
+        config.train.max_epochs = args.max_epochs
+        if is_main_process:
+            overrides.append(f"max_epochs = {args.max_epochs}")
+    
+    if args.val_freq is not None:
+        config.train.val_freq = args.val_freq
+        if is_main_process:
+            overrides.append(f"val_freq = {args.val_freq}")
+    
+    if hasattr(args, 'save_freq') and args.save_freq is not None:
+        config.train.save_freq = args.save_freq
+        if is_main_process:
+            overrides.append(f"save_freq = {args.save_freq}")
+    
+    if args.seed is not None:
+        config.train.seed = args.seed
+        if is_main_process:
+            overrides.append(f"seed = {args.seed}")
+    
+    if is_main_process and overrides:
+        print("\n📝 Config overrides:")
+        for override in overrides:
+            print(f"   - {override}")
+        print()
+    
+    return config
+
+
+def check_for_nan(value, name, global_step, checkpoint_dir=None, save_debug=False, batch=None, model=None):
+    """Check if a tensor or scalar value contains NaN or Inf, and optionally save debug info"""
+    if isinstance(value, torch.Tensor):
+        has_nan = torch.isnan(value).any().item()
+        has_inf = torch.isinf(value).any().item()
+        value_item = value.item() if value.numel() == 1 else None
+    else:
+        has_nan = (value != value) or np.isnan(value)  # NaN check for scalars
+        has_inf = np.isinf(value) if isinstance(value, (float, np.number)) else False
+        value_item = value
+    
+    if has_nan or has_inf:
+        status = []
+        if has_nan:
+            status.append("NaN")
+        if has_inf:
+            status.append("Inf")
+        
+        print(f"\n{'='*80}")
+        print(f"⚠️  WARNING: {name} contains {', '.join(status)} at global_step {global_step}")
+        print(f"{'='*80}")
+        
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                print(f"  Value: {value.item()}")
+            else:
+                print(f"  Shape: {value.shape}")
+                print(f"  NaN count: {torch.isnan(value).sum().item()}")
+                print(f"  Inf count: {torch.isinf(value).sum().item()}")
+                print(f"  Min: {value[~torch.isnan(value) & ~torch.isinf(value)].min().item() if (~torch.isnan(value) & ~torch.isinf(value)).any() else 'N/A'}")
+                print(f"  Max: {value[~torch.isnan(value) & ~torch.isinf(value)].max().item() if (~torch.isnan(value) & ~torch.isinf(value)).any() else 'N/A'}")
+        else:
+            print(f"  Value: {value_item}")
+        
+        if save_debug and checkpoint_dir is not None:
+            debug_path = os.path.join(checkpoint_dir, f'nan_debug_step_{global_step}.pt')
+            debug_data = {
+                'global_step': global_step,
+                'name': name,
+                'value': value,
+                'has_nan': has_nan,
+                'has_inf': has_inf,
+            }
+            if batch is not None:
+                debug_data['batch'] = {k: v for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            if model is not None:
+                # Save model state (unwrapped if DDP)
+                actual_model = model.module if hasattr(model, 'module') else model
+                debug_data['model_state'] = actual_model.state_dict()
+            
+            torch.save(debug_data, debug_path)
+            print(f"  💾 Debug info saved to: {debug_path}")
+        
+        print(f"{'='*80}\n")
+        
+        return True
+
+    return False
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss_dict, checkpoint_dir, is_ddp=False):
@@ -185,13 +319,18 @@ def create_scheduler(optimizer, config):
         total_epochs = config.max_epochs
         
         def lr_lambda(epoch):
-            # Linear interpolation: lr = initial_lr * (1 - epoch/total_epochs) + end_lr * (epoch/total_epochs)
-            # Simplified: lr = initial_lr - (initial_lr - end_lr) * (epoch / total_epochs)
-            if total_epochs == 0:
+            # LambdaLR: lr = initial_lr * lr_lambda(epoch)
+            # We want: lr(0) = initial_lr, lr(total_epochs) = end_lr
+            # Linear interpolation: lr = initial_lr + (end_lr - initial_lr) * (epoch / total_epochs)
+            # Factor: lr / initial_lr = 1 + (end_lr/initial_lr - 1) * (epoch / total_epochs)
+            if total_epochs == 0 or initial_lr == 0:
                 return 1.0
+            if epoch >= total_epochs:
+                return end_lr / initial_lr
             progress = epoch / total_epochs
-            factor = 1.0 - progress + (end_lr / initial_lr) * progress if initial_lr > 0 else 1.0
-            return max(factor, end_lr / initial_lr if initial_lr > 0 else 0.0)
+            # Factor should go from 1.0 (at epoch=0) to end_lr/initial_lr (at epoch=total_epochs)
+            factor = 1.0 + (end_lr / initial_lr - 1.0) * progress
+            return max(factor, end_lr / initial_lr)  # Ensure we don't go below end_lr
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif config.scheduler.type == 'none':
@@ -368,6 +507,7 @@ def format_coords(coords_tensor, mask, max_display=5):
 
 def format_translation(trans_tensor):
     """Format translation vector to string"""
+    trans_tensor = trans_tensor[0]
     trans = trans_tensor.cpu().numpy()
     return f"[{trans[0]:.4f}, {trans[1]:.4f}, {trans[2]:.4f}]"
 
