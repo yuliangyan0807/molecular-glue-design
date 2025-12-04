@@ -513,85 +513,249 @@ class InvariantPointAttention(nn.Module):
         
         return s
 
+# class PhiX(nn.Module):
+#     """
+#     It cross-attends protein features to ligand atoms and outputs pairwise weights φ_X(i,j).
+#     """
+#     def __init__(self, c_s, c_t, hidden_dim):
+#         super().__init__()
+#         self.hidden_dim = hidden_dim
+#         self.proj_s1 = nn.Linear(c_s, hidden_dim)
+#         self.proj_s2 = nn.Linear(c_s, hidden_dim)
+        
+#         # Extract invariant features from coord_diffs to generate queries
+#         # Input: [distance, |dx|, |dy|, |dz|] = 4 invariant features
+#         self.coord_to_query = nn.Sequential(
+#             nn.Linear(4, hidden_dim // 2),  # Process distance + 3D displacement magnitudes
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim // 2, hidden_dim)
+#         )
+        
+#         self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+#         self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        
+#         # MLP now takes coord_diffs features instead of just distances_sq
+#         self.mlp = nn.Sequential(
+#             nn.Linear(hidden_dim * 2 + 3 + c_t, hidden_dim),  # 3 for coord_diffs invariants
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, 1)
+#         )
+
+#     def forward(self, s1, s2, coord_diffs, t_emb, p1_mask, p2_mask, mol_mask):
+#         """
+#         Args:
+#             s1: (B, N1, c_s) - protein 1 features
+#             s2: (B, N2, c_s) - protein 2 features
+#             coord_diffs: (B, N, N, 3) - pairwise coordinate differences
+#             t_emb: (B, N, c_t) - time embedding
+#             p1_mask, p2_mask, mol_mask: boolean masks
+#         Returns:
+#             φ_X weights: (B, N, N, 1)
+#         """
+#         B, N, _, _ = coord_diffs.shape
+#         c_t = t_emb.shape[-1]
+
+#         # Linear projections for protein features
+#         s1_proj = self.proj_s1(s1)  # [B, N1, H]
+#         s2_proj = self.proj_s2(s2)  # [B, N2, H]
+
+#         # Extract invariant features from coord_diffs for query generation
+#         distances_sq = torch.sum(coord_diffs ** 2, dim=-1, keepdim=True)  # [B, N, N, 1]
+#         # Also use absolute values of each coordinate difference (rotation variant but informative)
+#         coord_abs = torch.abs(coord_diffs)  # [B, N, N, 3]
+#         # Combine into invariant features: [distance, |dx|, |dy|, |dz|]
+#         coord_invariants = torch.cat([distances_sq, coord_abs], dim=-1)  # [B, N, N, 4]
+        
+#         # Aggregate over pairwise features for each atom
+#         coord_features = torch.mean(coord_invariants, dim=2)  # [B, N, 4]
+#         # Use all 4 invariant features: [distance, |dx|, |dy|, |dz|]
+#         ligand_queries = self.coord_to_query(coord_features)  # [B, N, H]
+#         ligand_queries = ligand_queries * mol_mask.unsqueeze(-1)  # Apply mask to queries
+
+#         # Cross-attend ligand to protein 1 and 2
+#         attn_out_1, _ = self.cross_attn_1(ligand_queries, s1_proj, s1_proj,
+#                                           key_padding_mask=~p1_mask)
+#         attn_out_2, _ = self.cross_attn_2(ligand_queries, s2_proj, s2_proj,
+#                                           key_padding_mask=~p2_mask)
+
+#         # Apply mask to time embedding
+#         t_emb_masked = t_emb * mol_mask.unsqueeze(-1)
+        
+#         # Combine attended features and time embedding
+#         combined = torch.cat([attn_out_1, attn_out_2, t_emb_masked], dim=-1)  # [B, N, 2H + c_t]
+
+#         # Pairwise expansion and fusion with coord_diffs
+#         combined_i = combined.unsqueeze(2).expand(-1, N, N, -1)  # [B, N, N, 2H + c_t]
+#         # Use coord_diffs directly (model will learn invariant combinations)
+#         phi_input = torch.cat([combined_i, coord_diffs], dim=-1)  # [B, N, N, 2H + c_t + 3]
+
+#         phi_weights = self.mlp(phi_input)  # [B, N, N, 1]
+
+#         return phi_weights
+
 class PhiX(nn.Module):
     """
-    It cross-attends protein features to ligand atoms and outputs pairwise weights φ_X(i,j).
+    Implements the EGNN-style coordinate update:
+    X_i^pred = X_i^t + sum_{j≠i} (X_i^t - X_j^t) * φ_X(h_i, h_j, ||X_i^t - X_j^t||², t)
+    
+    Supports multi-layer updates where atom features are updated iteratively.
     """
-    def __init__(self, c_s, c_t, hidden_dim):
+    def __init__(self, c_s, c_t, hidden_dim, num_layers=3):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.c_s = c_s
+        self.c_t = c_t
+        
+        # Project atom features to hidden dimension
+        self.atom_proj = nn.Linear(c_s, hidden_dim)
+        
+        # Project protein features for cross-attention
         self.proj_s1 = nn.Linear(c_s, hidden_dim)
         self.proj_s2 = nn.Linear(c_s, hidden_dim)
         
-        # Extract invariant features from coord_diffs to generate queries
-        # Input: [distance, |dx|, |dy|, |dz|] = 4 invariant features
-        self.coord_to_query = nn.Sequential(
-            nn.Linear(4, hidden_dim // 2),  # Process distance + 3D displacement magnitudes
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim)
-        )
-        
+        # Cross-attention modules to incorporate protein context
         self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         
-        # MLP now takes coord_diffs features instead of just distances_sq
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 3 + c_t, hidden_dim),  # 3 for coord_diffs invariants
+        # Multi-layer feature update modules (EGNN-style)
+        self.feature_layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.feature_layers.append(nn.Sequential(
+                nn.Linear(hidden_dim * 2 + 1 + c_t, hidden_dim),  # h_i, h_j, dist_sq, t
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim)
+            ))
+        
+        # Final MLP to compute φ_X weights
+        # Input: h_i, h_j, ||X_i^t - X_j^t||², t
+        self.phi_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 1 + c_t, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
         )
+        
+        self.seq_embedder = nn.Embedding(54, c_s)
 
-    def forward(self, s1, s2, coord_diffs, t_emb, p1_mask, p2_mask, mol_mask):
+    def forward(self, s1, s2, X_tilde, lig_seq_tilde, t_emb, p1_mask, p2_mask, mol_mask):
         """
         Args:
             s1: (B, N1, c_s) - protein 1 features
             s2: (B, N2, c_s) - protein 2 features
-            coord_diffs: (B, N, N, 3) - pairwise coordinate differences
+            X_tilde: (B, N, 3) - noised coordinates at timestep t
+            lig_seq_tilde: (B, N) - noised sequence at timestep t
             t_emb: (B, N, c_t) - time embedding
             p1_mask, p2_mask, mol_mask: boolean masks
         Returns:
-            φ_X weights: (B, N, N, 1)
+            Updated coordinates: (B, N, 3)
         """
-        B, N, _, _ = coord_diffs.shape
-        c_t = t_emb.shape[-1]
+        B, N = X_tilde.shape[:2]
 
-        # Linear projections for protein features
-        s1_proj = self.proj_s1(s1)  # [B, N1, H]
-        s2_proj = self.proj_s2(s2)  # [B, N2, H]
-
-        # Extract invariant features from coord_diffs for query generation
+        X_i = X_tilde.unsqueeze(2)  # [B, N, 1, 3]
+        X_j = X_tilde.unsqueeze(1)  # [B, 1, N, 3]
+        coord_diffs = X_i - X_j     # [B, N, N, 3]
+        
+        # Get initial atom features from sequence embedding
+        atom_features = self.seq_embedder(lig_seq_tilde)  # (B, N, c_s)
+        
+        # Project atom features to hidden dimension
+        h = self.atom_proj(atom_features)  # (B, N, hidden_dim)
+        
+        # Incorporate protein context via cross-attention
+        s1_proj = self.proj_s1(s1)  # (B, N1, hidden_dim)
+        s2_proj = self.proj_s2(s2)  # (B, N2, hidden_dim)
+        
+        # Cross-attend atom features to protein features
+        h_attn1, _ = self.cross_attn_1(h, s1_proj, s1_proj, key_padding_mask=~p1_mask)
+        h_attn2, _ = self.cross_attn_2(h, s2_proj, s2_proj, key_padding_mask=~p2_mask)
+        
+        # Combine attended features.
+        h = (h_attn1 + h_attn2 + h) / 3.0  # (B, N, hidden_dim)
+        h = h * mol_mask.unsqueeze(-1)  # Apply mask
+        
+        # Compute squared distances: ||X_i^t - X_j^t||²
         distances_sq = torch.sum(coord_diffs ** 2, dim=-1, keepdim=True)  # [B, N, N, 1]
-        # Also use absolute values of each coordinate difference (rotation variant but informative)
-        coord_abs = torch.abs(coord_diffs)  # [B, N, N, 3]
-        # Combine into invariant features: [distance, |dx|, |dy|, |dz|]
-        coord_invariants = torch.cat([distances_sq, coord_abs], dim=-1)  # [B, N, N, 4]
+        # Clamp initial distances_sq to prevent numerical issues
+        distances_sq = torch.clamp(distances_sq, min=0.0, max=1e6)  # Max distance ~1000 Angstroms
         
-        # Aggregate over pairwise features for each atom
-        coord_features = torch.mean(coord_invariants, dim=2)  # [B, N, 4]
-        # Use all 4 invariant features: [distance, |dx|, |dy|, |dz|]
-        ligand_queries = self.coord_to_query(coord_features)  # [B, N, H]
-        ligand_queries = ligand_queries * mol_mask.unsqueeze(-1)  # Apply mask to queries
-
-        # Cross-attend ligand to protein 1 and 2
-        attn_out_1, _ = self.cross_attn_1(ligand_queries, s1_proj, s1_proj,
-                                          key_padding_mask=~p1_mask)
-        attn_out_2, _ = self.cross_attn_2(ligand_queries, s2_proj, s2_proj,
-                                          key_padding_mask=~p2_mask)
-
-        # Apply mask to time embedding
-        t_emb_masked = t_emb * mol_mask.unsqueeze(-1)
+        # Multi-layer feature updates (EGNN-style)
+        for layer in self.feature_layers:
+            # Expand features for pairwise computation
+            h_i = h.unsqueeze(2).expand(-1, -1, N, -1)  # (B, N, N, hidden_dim)
+            h_j = h.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, N, hidden_dim)
+            
+            # Expand time embedding for pairwise computation
+            t_emb_expanded = t_emb.unsqueeze(2).expand(-1, -1, N, -1)  # (B, N, N, c_t)
+            
+            # Combine: [h_i, h_j, dist_sq, t]
+            layer_input = torch.cat([
+                h_i,  # (B, N, N, hidden_dim)
+                h_j,  # (B, N, N, hidden_dim)
+                distances_sq,  # (B, N, N, 1)
+                t_emb_expanded  # (B, N, N, c_t)
+            ], dim=-1)  # (B, N, N, 2*hidden_dim + 1 + c_t)
+            
+            # Update features by aggregating messages from neighbors
+            messages = layer(layer_input)  # (B, N, N, hidden_dim)
+            
+            # Aggregate messages (sum over j, excluding self)
+            # Create mask to exclude self-interactions
+            self_mask = torch.eye(N, device=h.device, dtype=torch.bool).unsqueeze(0).unsqueeze(-1)  # (1, N, N, 1)
+            mol_mask_2d = mol_mask.unsqueeze(2) & mol_mask.unsqueeze(1)  # (B, N, N)
+            valid_mask = (~self_mask) & mol_mask_2d.unsqueeze(-1)  # (B, N, N, 1)
+            
+            messages = messages * valid_mask.float()
+            h_update = torch.sum(messages, dim=2)  # (B, N, hidden_dim)
+            
+            # Residual connection
+            h = h + h_update
+            h = h * mol_mask.unsqueeze(-1)
         
-        # Combine attended features and time embedding
-        combined = torch.cat([attn_out_1, attn_out_2, t_emb_masked], dim=-1)  # [B, N, 2H + c_t]
+            # Compute φ_X weights using final updated features
+            h_i = h.unsqueeze(2).expand(-1, -1, N, -1)  # (B, N, N, hidden_dim)
+            h_j = h.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, N, hidden_dim)
+            
+            # Input to φ_X: [h_i, h_j, ||X_i^t - X_j^t||², t]
+            phi_input = torch.cat([
+                h_i,  # (B, N, N, hidden_dim)
+                h_j,  # (B, N, N, hidden_dim)
+                distances_sq,  # (B, N, N, 1)
+                t_emb_expanded  # (B, N, N, c_t)
+            ], dim=-1)  # (B, N, N, 2*hidden_dim + 1 + c_t)
+        
+            # Compute weights
+            phi_weights = self.phi_mlp(phi_input)  # (B, N, N, 1)
 
-        # Pairwise expansion and fusion with coord_diffs
-        combined_i = combined.unsqueeze(2).expand(-1, N, N, -1)  # [B, N, N, 2H + c_t]
-        # Use coord_diffs directly (model will learn invariant combinations)
-        phi_input = torch.cat([combined_i, coord_diffs], dim=-1)  # [B, N, N, 2H + c_t + 3]
+            invalid_mask = self_mask | ~mol_mask_2d.unsqueeze(-1)
+            phi_weights = phi_weights.masked_fill(invalid_mask, 0.0)
+            
+            # Clamp phi_weights to prevent numerical instability
+            # Limit the magnitude of coordinate updates
+            phi_weights = torch.clamp(phi_weights, min=-10.0, max=10.0)
+            
+            # Update coordinates with step size control
+            coord_update = torch.sum(phi_weights * coord_diffs, dim=2)  # (B, N, 3)
+            # Limit the magnitude of coordinate updates per step (prevent explosion)
+            coord_update_norm = torch.norm(coord_update, dim=-1, keepdim=True)  # (B, N, 1)
+            max_update_norm = 15.0  # Maximum update per step in Angstroms
+            coord_update = coord_update * torch.clamp(max_update_norm / (coord_update_norm + 1e-8), max=1.0)
+            
+            X_tilde = X_tilde + coord_update
+            X_tilde = X_tilde * mol_mask.unsqueeze(-1)  # Apply mask
 
-        phi_weights = self.mlp(phi_input)  # [B, N, N, 1]
+            # Recompute coord_diffs and distances_sq using updated coordinates
+            X_i = X_tilde.unsqueeze(2).expand(-1, -1, N, -1)  # [B, N, N, 3]
+            X_j = X_tilde.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, 3]
+            coord_diffs = X_i - X_j     # [B, N, N, 3]
+            distances_sq = torch.sum(coord_diffs ** 2, dim=-1, keepdim=True)  # [B, N, N, 1]
+            
+            # Clamp distances_sq to prevent numerical issues (very large distances)
+            distances_sq = torch.clamp(distances_sq, min=0.0, max=1e6)  # Max distance ~1000 Angstroms
 
-        return phi_weights
+        return X_tilde
 
 class PhiA(nn.Module):
     """
@@ -755,25 +919,25 @@ class PhiT(nn.Module):
         self.hidden_dim = hidden_dim
         self.proj_s1 = nn.Linear(c_s, hidden_dim)
         self.proj_s2 = nn.Linear(c_s, hidden_dim)
-        self.proj_dist = nn.Linear(1, hidden_dim)  # Project distance feature
+        self.proj_mu_diff = nn.Linear(3, hidden_dim)  # Project noised translation vector feature
         self.cross_attn_1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + c_t, hidden_dim),
+            nn.Linear(hidden_dim * 3 + c_t + 1, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 3)  # Output translation vector in R^3
         )
 
-    def forward(self, s1, s2, t_emb, R_pred,
+    def forward(self, s1, s2, t_emb, t_tilde,
                 p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
                 p1_mask, p2_mask, mol_mask):
         """
         Args:
             s1, s2: (B, N, c_s) - protein embeddings
             t_emb: (B, N, c_t) - time embedding for molecular glue
-            R_pred: (B, 3, 3) - predicted rotation matrix
+            t_tilde: (B, 3) - noised translation vector
             p1_coords, p2_coords: (B, N, 3) - CA coordinates
             p1_n_coords, p2_n_coords: (B, N, 3) - N coordinates
             p1_c_coords, p2_c_coords: (B, N, 3) - C coordinates
@@ -797,19 +961,21 @@ class PhiT(nn.Module):
         
         s1_proj = self.proj_s1(s1)
         s2_proj = self.proj_s2(s2)
-        dist_proj = self.proj_dist(centroid_dist_sq)  # (B, 1, hidden_dim)
+        mu_diff_proj = self.proj_mu_diff(centroid_diff)  # (B, 1, hidden_dim)
 
-        attn_out_1, _ = self.cross_attn_1(dist_proj, s1_proj, s1_proj, key_padding_mask=~p1_mask)
-        attn_out_2, _ = self.cross_attn_2(dist_proj, s2_proj, s2_proj, key_padding_mask=~p2_mask)
+        attn_out_1, _ = self.cross_attn_1(mu_diff_proj, s1_proj, s1_proj, key_padding_mask=~p1_mask)
+        attn_out_2, _ = self.cross_attn_2(mu_diff_proj, s2_proj, s2_proj, key_padding_mask=~p2_mask)
 
         # Compute masked mean of time embedding
         mol_mask_expanded = mol_mask.unsqueeze(-1)  # (B, N, 1)
         t_emb_mean = (t_emb * mol_mask_expanded).sum(1, keepdim=True) / (mol_mask.sum(1, keepdim=True).unsqueeze(-1) + 1e-8)  # (B, 1, c_t)
         
-        combined = torch.cat([attn_out_1, attn_out_2, dist_proj, t_emb_mean], dim=-1)
-        delta_t = self.mlp(combined).view(-1, 3)  # Translation residual in R^3, [B, 3]
+        combined = torch.cat([attn_out_1, attn_out_2, mu_diff_proj, t_emb_mean, centroid_dist_sq], dim=-1)
+        delta_t = centroid_diff.squeeze(1) * self.mlp(combined).view(-1, 3)  # Translation residual in R^3, [B, 3]
 
-        return delta_t
+        predict_t = t_tilde + delta_t
+
+        return predict_t
 
 
 class TernaryDenoiseBlock(nn.Module):
@@ -910,44 +1076,22 @@ class TernaryDenoiseBlock(nn.Module):
         # Time embedding
         t_emb = self.embed_t(t, mol_mask)  # [B, N, c_t]
 
-        # Compute pairwise interaction weights via PhiX using coord_diffs
-        phi_weights = self.phi_X(s1_tilde, s2_tilde, coord_diffs, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, N, 1]
-        phi_weights = phi_weights.masked_fill(combined_mask, 0.0)  # [B, N, N, 1]
-
-        # Predict coordinates via weighted aggregation of pairwise displacements
-        X_pred = torch.sum(coord_diffs * phi_weights, dim=2)  # [B, N, 3]
-        X_pred = X_pred * mol_mask.unsqueeze(-1)  # Apply final mask for safety
+        # Compute updated coordinates via PhiX (with multi-layer coordinate updates)
+        # Formula: X_i^pred = X_i^t + sum_{j≠i} (X_i^t - X_j^t) * φ_X(h_i, h_j, ||X_i^t - X_j^t||², t)
+        # PhiX now performs multi-layer updates internally and returns the final coordinates
+        X_pred = self.phi_X(s1_tilde, s2_tilde, X_tilde, seq_tilde, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 3]
 
         #########################################################
         # Molecular glue sequence prediction.
         #########################################################
-        # Sequence prediction using PhiA: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(s̃^(1), s̃^(2), ã_j^t, t)
+        # Sequence prediction using PhiA: a_i^pred = φ_A(s̃^(1), s̃^(2), ã_i^t, t)
         seq_embed = self.seq_embedder(seq_tilde)  # [B, N, c_s] - ã_j^t
         
         # Get probability distributions from PhiA for each atom
         phi_a_probs = self.phi_A(s1_tilde, s2_tilde, seq_embed, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 54]
         
-        # Compute pairwise distances between predicted coordinates
-        X_pred_i = X_pred.unsqueeze(2)  # [B, N, 1, 3]
-        X_pred_j = X_pred.unsqueeze(1)  # [B, 1, N, 3]
-        pred_coord_diffs = X_pred_i - X_pred_j  # [B, N, N, 3]
-        pred_distances_sq = torch.sum(pred_coord_diffs ** 2, dim=-1)  # [B, N, N]
-        
-        # Apply the same masking as PhiX (mask out self-interactions and invalid pairs)
-        pred_distances_sq = pred_distances_sq.masked_fill(combined_mask.squeeze(-1), 0.0)  # [B, N, N]
-        
-        # Weighted aggregation: a_i^pred = Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
-        # Expand phi_a_probs for pairwise computation: [B, N, 54] -> [B, N, N, 54]
-        phi_a_probs_expanded = phi_a_probs.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, N, 54]
-        
-        # Weight by distances: [B, N, N, 1] * [B, N, N, 54] = [B, N, N, 54]
-        weighted_probs = pred_distances_sq.unsqueeze(-1) * phi_a_probs_expanded  # [B, N, N, 54]
-        
-        # Sum over j: Σ_j ||X_i^pred - X_j^pred||² φ_A(...)
-        seq_pred = torch.sum(weighted_probs, dim=2)  # [B, N, 54]
-        
         # Apply final mask
-        seq_pred = seq_pred * mol_mask.unsqueeze(-1)
+        seq_pred = phi_a_probs * mol_mask.unsqueeze(-1)
 
         #########################################################
         # Rotation matrix  prediction to move the protein 2 to the final ternary complex.
@@ -959,12 +1103,12 @@ class TernaryDenoiseBlock(nn.Module):
         #########################################################
         # Translation vector prediction to move the protein 2 to the final ternary complex.
         #########################################################
-        delta_t = self.phi_T(s1_tilde, s2_tilde, t_emb, R_pred,
+        t_pred = self.phi_T(s1_tilde, s2_tilde, t_emb, t_tilde,
                             p1_coords, p2_coords, p1_n_coords, p2_n_coords, p1_c_coords, p2_c_coords,
                             p1_mask, p2_mask, mol_mask)
         
         # Apply the rotation to the translation residual: t_pred = t_tilde + R_pred * Δt
-        t_pred = t_tilde + torch.matmul(R_pred, delta_t.unsqueeze(-1)).squeeze(-1)  # [B, 3]
+        # t_pred = t_tilde + torch.matmul(R_pred, delta_t.unsqueeze(-1)).squeeze(-1)  # [B, 3]
 
         return X_pred, seq_pred, R_pred, t_pred
 
