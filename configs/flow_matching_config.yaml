@@ -1,0 +1,69 @@
+model:
+  encoder:
+    node_embed_size: 128
+    edge_embed_size: 64
+    ipa:
+      c_s: 128 #${model.node_embed_size}
+      c_z: 64 #${model.edge_embed_size}
+      c_hidden: 128
+      no_heads: 8
+      no_qk_points: 8
+      no_v_points: 12
+      seq_tfmr_num_heads: 4
+      seq_tfmr_num_layers: 2
+      num_blocks: 6
+      stop_grad: False
+  interpolant:
+    min_t: 1.e-2
+    t_normalization_clip: 0.9
+    sample_sequence: True
+    sample_structure: True
+    rots:
+      train_schedule: linear
+      sample_schedule: exp
+      exp_rate: 10
+    trans:
+      train_schedule: linear
+      sample_schedule: linear
+      sigma: 1.0
+    seqs:
+      num_classes: 54
+      simplex_value: 5.0
+    sampling:
+      num_timesteps: 100
+    self_condition: False
+  interface_model:
+    feat_dim: 128
+    num_nearest_neighbors: 16
+train:
+  loss_weights:
+    trans_loss: 1.0
+    rot_loss: 1.0
+    seqs_loss: 1.0
+    coords_loss: 1.0
+  max_epochs: 200
+  val_freq: 1  # Validate every N epochs
+  save_freq: 20  # Save checkpoint every N epochs (also saves at last epoch)
+  num_val_samples: 10  # Number of samples to validate on (randomly selected from validation set)
+  batch_size: 1
+  accum_grad: 1
+  seed: 114514
+  max_grad_norm: 100.0
+  optimizer:
+    type: adam
+    lr: 5.e-4 #1.e-4
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+  scheduler:
+    type: linear  # Options: plateau, cosine, linear, none
+    end_lr: 1.e-4  # Final learning rate for linear scheduler (only used when type=linear)
+    # Plateau scheduler options (only used when type=plateau):
+    # factor: 0.8
+    # patience: 10
+    # min_lr: 5.e-6
+
+dataset:
+  path: flow_matching_dataset_v2  # Path to load dataset from disk
+  train_split: 0.95  # Fraction of data for training
+  val_split: 0.05    # Fraction of data for validation
