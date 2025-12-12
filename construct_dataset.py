@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 import torch
+import rdkit
 from tqdm import tqdm
 from rdkit import Chem
 from copy import deepcopy
@@ -9,8 +10,13 @@ from configs.config import DATASET_ARGS, DictToObject
 from pocket import get_elilipsoid_for_interface, get_interface_from_graphs
 from random import sample
 import json
+import warnings
+warnings.filterwarnings('ignore')
 
 from datasets import Dataset, load_from_disk
+from utils.rigid_utils import parse_pdb, get_torsion_angle, parse_pdb_ligand
+from utils.constants import BBHeavyAtom
+from utils.training_utils import collate_fn
 
 from DeepTernary.deepternary.models.process_mols import (
     distance_featurizer,
@@ -25,7 +31,6 @@ from DeepTernary.deepternary.models.process_mols import (
 )
 from DeepTernary.deepternary.models.ternary_pdb import get_pocket_and_mask
 from DeepTernary.deepternary.models.geometry_utils import random_rotation_translation
-
 
 def read_ligand_pdb(pdb_path, sanitize=True, remove_hs=True, return_symbols=False):
     """
@@ -96,7 +101,6 @@ def read_ligand_pdb(pdb_path, sanitize=True, remove_hs=True, return_symbols=Fals
 
     return Z, coords
 
-
 def construct_interface_modeling_dataset(
     data_dir: str,
 ):
@@ -105,8 +109,8 @@ def construct_interface_modeling_dataset(
         complex_dir = os.path.join(data_dir, entry)
         if os.path.isdir(complex_dir):
             complexes.append(complex_dir)
-    
-    ds_cfg = DictToObject(DATASET_ARGS)
+
+    print(f"Number of complexes: {len(complexes)}")
 
     dataset = []
 
@@ -118,79 +122,37 @@ def construct_interface_modeling_dataset(
         p1_path = os.path.join(complex_dir, 'protein1.pdb')
         p2_path = os.path.join(complex_dir, 'protein2.pdb')
 
-        recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p1_path)
-        p1_graph = get_rec_graph(
-            recs, recs_coords, c_alpha_coords, n_coords, c_coords,
-            use_rec_atoms=ds_cfg.use_rec_atoms,
-            rec_radius=ds_cfg.rec_graph_radius,
-            surface_max_neighbors=ds_cfg.surface_max_neighbors,
-            surface_graph_cutoff=ds_cfg.surface_graph_cutoff,
-            surface_mesh_cutoff=ds_cfg.surface_mesh_cutoff,
-            c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
-        )
-        protein1_coords_gt = deepcopy(p1_graph.ndata['x'])
+        # Build protein structures.
+        p1 = parse_pdb(p1_path)[0]
+        p2 = parse_pdb(p2_path)[0]
 
-        recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p2_path)
-        p2_graph = get_rec_graph(
-            recs, recs_coords, c_alpha_coords, n_coords, c_coords,
-            use_rec_atoms=ds_cfg.use_rec_atoms,
-            rec_radius=ds_cfg.rec_graph_radius,
-            surface_max_neighbors=ds_cfg.surface_max_neighbors,
-            surface_graph_cutoff=ds_cfg.surface_graph_cutoff,
-            surface_mesh_cutoff=ds_cfg.surface_mesh_cutoff,
-            c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
-        )
-        protein2_coords_gt = deepcopy(p2_graph.ndata['x'])
+        p1_ca_coords = p1['pos_heavyatom'][:, BBHeavyAtom.CA, :]
+        p2_ca_coords = p2['pos_heavyatom'][:, BBHeavyAtom.CA, :]
 
-        # Get the protein1 and protein2's residue sequence.
-        p1_residue = p1_graph.ndata['feat'][:, 0]
-        p2_residue = p2_graph.ndata['feat'][:, 0]
+        p1_residue = p1['aa']
+        p2_residue = p2['aa']
         
         # Extract interface coordinates.
-        interface_coords, p1_interface_mask, p2_interface_mask, p1_interface_residues, p2_interface_residues = get_interface_from_graphs(
-            protein1_coords_gt, 
-            protein2_coords_gt, 
-            cutoff=8.0
+        _, p1_interface_mask, p2_interface_mask, p1_interface_residues, p2_interface_residues = get_interface_from_graphs(
+            p1_ca_coords, 
+            p2_ca_coords, 
+            cutoff=8.0 # 8.0 Å for C-alpha atoms cutoff distance.
         )
         
         # Check if interface has any residues - skip if none
-        if len(p1_interface_residues) == 0 and len(p2_interface_residues) == 0:
+        if len(p1_interface_residues) == 0 or len(p2_interface_residues) == 0:
             print(f"⚠️  Complex {name}: No interface residues found, skipping...")
             continue
 
-        
-        # Store original interface coordinates before any transformations
-        interface_coords_original = deepcopy(interface_coords)
-        # Flag if only one side has interface (based on original detection)
-        single_sided = (len(p1_interface_residues) == 0) != (len(p2_interface_residues) == 0)
+        # Move proteins to centroid.
+        p1_centroid = torch.sum(p1_ca_coords, dim=0) / len(p1_ca_coords)
+        p2_centroid = torch.sum(p2_ca_coords, dim=0) / len(p2_ca_coords)
+        p1_ca_coords = p1_ca_coords - p1_centroid
+        p2_ca_coords = p2_ca_coords - p2_centroid
 
-        # Decide randomly whether to move p1 or p2 (50% chance each)
-        move_p1 = random.random() < 0.5
-
-        if move_p1:
-            # random move p1
-            protein1_rot_T, protein1_rot_b = random_rotation_translation(translation_distance=5)
-            protein1_coord_to_move = p1_graph.ndata['x']
-            protein1_mean_to_remove = protein1_coord_to_move.mean(dim=0, keepdims=True)
-            p1_graph.ndata['x'] = (protein1_rot_T @ (protein1_coord_to_move - protein1_mean_to_remove).T).T + protein1_rot_b
-        else:
-            # random move p2
-            protein2_rot_T, protein2_rot_b = random_rotation_translation(translation_distance=5)
-            protein2_coord_to_move = p2_graph.ndata['x']
-            protein2_mean_to_remove = protein2_coord_to_move.mean(dim=0, keepdims=True)
-            p2_graph.ndata['x'] = (protein2_rot_T @ (protein2_coord_to_move - protein2_mean_to_remove).T).T + protein2_rot_b
-
-        # Get the protein1 and protein2's C-alpha coordinates.
-        p1_coords = p1_graph.ndata['x']
-        p2_coords = p2_graph.ndata['x']
-
-        # Build separate interfaces for p1 and p2 (moved protein's interface moves accordingly)
-        p1_interface_coords = p1_coords[p1_interface_mask]
-        p2_interface_coords = p2_coords[p2_interface_mask]
-
-        # Fallback: make both sides non-empty if possible
-        p1_interface_coords = p1_interface_coords if len(p1_interface_coords) > 0 else p2_interface_coords
-        p2_interface_coords = p2_interface_coords if len(p2_interface_coords) > 0 else p1_interface_coords
+        # Build separate interfaces for p1 and p2.
+        p1_interface_coords = p1_ca_coords[p1_interface_mask]
+        p2_interface_coords = p2_ca_coords[p2_interface_mask]
 
         # Compute per-interface ellipsoids
         i1_mu, i1_sigma = get_elilipsoid_for_interface(p1_interface_coords)
@@ -200,13 +162,10 @@ def construct_interface_modeling_dataset(
             'name': name,
             'p1_residue': p1_residue,
             'p2_residue': p2_residue,
-            'p1_coords_gt': protein1_coords_gt,
-            'p2_coords_gt': protein2_coords_gt,
-            'p1_coords': p1_coords,
-            'p2_coords': p2_coords,
+            'p1_coords': p1_ca_coords,
+            'p2_coords': p2_ca_coords,
             'p1_interface_mask': p1_interface_mask,
             'p2_interface_mask': p2_interface_mask,
-            'interface_coords_original': interface_coords_original,
             'p1_interface_coords': p1_interface_coords,
             'i1_mu': i1_mu,
             'i1_sigma': i1_sigma,
@@ -215,26 +174,24 @@ def construct_interface_modeling_dataset(
             'i2_sigma': i2_sigma,
             'p1_interface_residues': p1_interface_residues,
             'p2_interface_residues': p2_interface_residues,
-            'single_sided': single_sided,
         }
         # print(data)
     
         dataset.append(data)
     
     dataset = Dataset.from_list(dataset)
-
+    print(f"Number of complexes for interface modeling: {len(dataset)}")
     return dataset
 
 def construct_flow_matching_dataset(
     data_dir: str,
+    ligand_center: bool = True,
 ):
     complexes = []
     for entry in sorted(os.listdir(data_dir)):
         complex_dir = os.path.join(data_dir, entry)
         if os.path.isdir(complex_dir):
             complexes.append(complex_dir)
-    
-    ds_cfg = DictToObject(DATASET_ARGS)
 
     dataset = []
 
@@ -251,108 +208,138 @@ def construct_flow_matching_dataset(
 
         p1_path = os.path.join(complex_dir, 'protein1.pdb')
         p2_path = os.path.join(complex_dir, 'protein2.pdb')
-        lig_path = os.path.join(complex_dir, 'ligand.pdb')
+        # lig_path = os.path.join(complex_dir, 'ligand.pdb')
+        lig_path = os.path.join(complex_dir, 'ligand_rcsb.sdf')
 
-        lig_Z, lig_coords = read_ligand_pdb(lig_path, sanitize=True, remove_hs=ds_cfg.remove_h)
-        lig_coords_gt = deepcopy(lig_coords)
+        # Build protein structures.
+        p1 = parse_pdb(p1_path)[0]
+        p2 = parse_pdb(p2_path)[0]
 
-        # Build receptor graphs
-        recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p1_path)
-        p1_graph = get_rec_graph(
-            recs, recs_coords, c_alpha_coords, n_coords, c_coords,
-            use_rec_atoms=ds_cfg.use_rec_atoms,
-            rec_radius=ds_cfg.rec_graph_radius,
-            surface_max_neighbors=ds_cfg.surface_max_neighbors,
-            surface_graph_cutoff=ds_cfg.surface_graph_cutoff,
-            surface_mesh_cutoff=ds_cfg.surface_mesh_cutoff,
-            c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
-        )
-        protein1_coords_gt = deepcopy(p1_graph.ndata['x'])
-        
-        # Store C and N coordinates for protein1
-        p1_n_coords_gt = torch.from_numpy(n_coords.astype(np.float32))
-        p1_c_coords_gt = torch.from_numpy(c_coords.astype(np.float32))
+        # lig_Z, lig_coords = read_ligand_pdb(lig_path, sanitize=True, remove_hs=True)
+        try: 
+            lig = parse_pdb_ligand(lig_path, heavy_only=True, mode='full')
+        except Exception as e:
+            print(f"Error: {e}")
+            print(f"Ligand path: {lig_path} does not exist.")
+            continue
+        # Encoded ligand atom type with hybridization and aromaticity.
+        lig_full_element = lig['ligand_atom_feature_full']
+        lig_coords = lig['pos']
+        # lig_coords_gt = deepcopy(lig_coords)
+        # print(center)
+        if ligand_center:
+            # Find the center of the ligand.
+            center = np.sum(lig_coords, axis=0) / len(lig_coords)
+            lig_coords = lig_coords - center
 
-        recs, recs_coords, c_alpha_coords, n_coords, c_coords = get_receptor_inference(p2_path)
-        p2_graph = get_rec_graph(
-            recs, recs_coords, c_alpha_coords, n_coords, c_coords,
-            use_rec_atoms=ds_cfg.use_rec_atoms,
-            rec_radius=ds_cfg.rec_graph_radius,
-            surface_max_neighbors=ds_cfg.surface_max_neighbors,
-            surface_graph_cutoff=ds_cfg.surface_graph_cutoff,
-            surface_mesh_cutoff=ds_cfg.surface_mesh_cutoff,
-            c_alpha_max_neighbors=ds_cfg.c_alpha_max_neighbors,
-        )
-        protein2_coords_gt = deepcopy(p2_graph.ndata['x'])
-        
-        # Store C and N coordinates for protein2
-        p2_n_coords_gt = torch.from_numpy(n_coords.astype(np.float32))
-        p2_c_coords_gt = torch.from_numpy(c_coords.astype(np.float32))
+            # print(p1['pos_heavyatom'])
+            # Move the protein to the center of the ligand.
+            p1['pos_heavyatom'] = p1['pos_heavyatom'] - center[None, None, :]
+            # print(p1['pos_heavyatom'])
+            p2['pos_heavyatom'] = p2['pos_heavyatom'] - center[None, None, :]
+            # Calculate the torsion angles after translation.
+            p1['torsion_angle'], p1['torsion_angle_mask'] = get_torsion_angle(p1['pos_heavyatom'], p1['aa'])
+            p2['torsion_angle'], p2['torsion_angle_mask'] = get_torsion_angle(p2['pos_heavyatom'], p2['aa'])
+            
+            # Save original p2 coordinates before random transformation
+            # p2_pos_heavyatom_orig = p2['pos_heavyatom'].clone()
+            
+            # Randomly move p2: generate rotation matrix and translation vector
+            rot_T, rot_b = random_rotation_translation(translation_distance=5.0)
+            # rot_T: [3, 3] rotation matrix, rot_b: [3] translation vector
+            
+            # Extract CA coordinates to compute centroid
+            # pos_heavyatom shape: [L, A, 3], mask_heavyatom shape: [L, A]
+            p1_ca_coords = p1['pos_heavyatom'][:, BBHeavyAtom.CA, :]  # [L, 3]
+            mean_to_remove = p1_ca_coords.mean(dim=0, keepdim=True)  # [1, 3]
+            
+            # Apply transformation to all heavy atoms
+            # pos_heavyatom shape: [L, A, 3]
+            L, A = p2['pos_heavyatom'].shape[:2]
+            p2_coords_flat = p2['pos_heavyatom'].reshape(L * A, 3)  # [L*A, 3]
+            
+            # Apply rotation and translation: X_moved = R @ (X_orig - mean) + t
+            # Inverse:X_orig = R^T @ X_moved + (mean - R^T @ t)
+            p2_coords_flat_transformed = (rot_T @ (p2_coords_flat - mean_to_remove.squeeze(0)).T).T + rot_b
+            p2['pos_heavyatom'] = p2_coords_flat_transformed.reshape(L, A, 3)
+            
+            R = rot_T  # [3, 3]
+            t = rot_b  # [3]
+            R_inv = R.T  # [3, 3]
+            t_inv = (mean_to_remove.squeeze(0) - R_inv @ t.squeeze(0))  # [3]
+            
+            # Simple verification: check if coordinates can be restored
+            # p2_coords_flat_orig = p2_pos_heavyatom_orig.reshape(L * A, 3)  # [L*A, 3]
+            # p2_coords_flat_restored = (R_inv @ p2_coords_flat_transformed.T).T + t_inv  # [L*A, 3]
+            # restoration_error = torch.abs(p2_coords_flat_restored - p2_coords_flat_orig).max().item()
+            # print(p2_coords_flat_orig)
+            # print(p2_coords_flat_restored)
+            # print(restoration_error)
+            
+            # Convert to numpy for storage
+            R_inv_np = R_inv.numpy().astype(np.float32)  # [3, 3]
+            t_inv_np = t_inv.numpy().astype(np.float32)  # [3]
+        else:
+            # Move the ligand to the center of the protein 1, and move the protein 2 to the center of itself with random rotation.
+            p1_ca_coords = p1['pos_heavyatom'][:, BBHeavyAtom.CA, :]
+            center = torch.sum(p1_ca_coords, dim=0) / len(p1_ca_coords)
 
-        # Get the protein1 and protein2's residue sequence.
-        p1_residue = p1_graph.ndata['feat'][:, 0]
-        p2_residue = p2_graph.ndata['feat'][:, 0]
+            # 1. Update Ligand coordinates (center relative to P1 center)
+            lig_coords = lig_coords - center[None, :].numpy()
 
-        # Move all molecules to protein1's centroid as origin for training stability
-        p1_centroid = protein1_coords_gt.mean(dim=0, keepdims=True)  # [1, 3]
-        
-        # Move protein1 coordinates to origin
-        p1_graph.ndata['x'] = protein1_coords_gt - p1_centroid
-        p1_n_coords = p1_n_coords_gt - p1_centroid
-        p1_c_coords = p1_c_coords_gt - p1_centroid
-        
-        # Move protein2 coordinates relative to protein1's centroid
-        p2_graph.ndata['x'] = protein2_coords_gt - p1_centroid
-        p2_n_coords = p2_n_coords_gt - p1_centroid
-        p2_c_coords = p2_c_coords_gt - p1_centroid
-        
-        # Move ligand coordinates relative to protein1's centroid
-        lig_coords = lig_coords - p1_centroid.squeeze(0).numpy()
+            # 2. Update Protein 1 coordinates (center at origin)
+            p1['pos_heavyatom'] = p1['pos_heavyatom'] - center[None, None, :]
+            # Recalculate torsion angles for P1 after translation (consistency with if block)
+            p1['torsion_angle'], p1['torsion_angle_mask'] = get_torsion_angle(p1['pos_heavyatom'], p1['aa'])
 
-        # Fixed move protein2 as in interface dataset
-        rot_T, rot_b = random_rotation_translation(translation_distance=5)
-        coords_to_move = p2_graph.ndata['x']
-        mean_to_remove = coords_to_move.mean(dim=0, keepdims=True)
-        p2_graph.ndata['x'] = (rot_T @ (coords_to_move - mean_to_remove).T).T + rot_b
-        
-        # Apply same transformation to C and N coordinates
-        p2_n_coords = (rot_T @ (p2_n_coords - mean_to_remove).T).T + rot_b
-        p2_c_coords = (rot_T @ (p2_c_coords - mean_to_remove).T).T + rot_b
+            # 3. Handle Protein 2 (Center at self-origin + Random Rotation)
+            # Calculate P2's original geometric center
+            p2_ca_coords = p2['pos_heavyatom'][:, BBHeavyAtom.CA, :]
+            p2_center = torch.mean(p2_ca_coords, dim=0)
 
-        # Compute inverse transform that maps moved protein back to original position
-        # X_moved = R @ (X_orig - mean) + b  =>  X_orig = R^T @ X_moved + (mean - R^T @ b)
-        R = rot_T  # [3,3]
-        t = rot_b  # [3]
-        R_inv = R.T
-        t_inv = (mean_to_remove.squeeze(0) - R_inv @ t.squeeze(0))
+            # Generate random rotation (translation_distance=0 because we center it manually)
+            rot_T, _ = random_rotation_translation(translation_distance=0.0)
+            
+            # Flatten P2 coordinates for matrix multiplication
+            L, A = p2['pos_heavyatom'].shape[:2]
+            p2_coords_flat = p2['pos_heavyatom'].reshape(L * A, 3)
 
-        # Collect current (possibly moved) coords
-        p1_coords = p1_graph.ndata['x']
-        p2_coords = p2_graph.ndata['x']
+            # Transform P2: (X - P2_center) * R^T (equivalent to R @ vec)
+            # Move P2 to its own center (0,0,0) then rotate
+            p2_coords_flat_centered = p2_coords_flat - p2_center
+            p2_coords_flat_transformed = (rot_T @ p2_coords_flat_centered.T).T
+            
+            # Update P2 coordinates
+            p2['pos_heavyatom'] = p2_coords_flat_transformed.reshape(L, A, 3)
+            # Recalculate torsion angles for P2
+            p2['torsion_angle'], p2['torsion_angle_mask'] = get_torsion_angle(p2['pos_heavyatom'], p2['aa'])
+
+            # 4. Calculate the Inverse Transformation (Ground Truth Label)
+            # We need (R_inv, t_inv) to map the 'Randomized P2' back to 'GT P2 relative to Centered P1'.
+            # Target (GT relative): P2_orig - P1_center
+            # Current (Input): R @ (P2_orig - P2_center)
+            #
+            # Derivation:
+            # R_inv @ Current = P2_orig - P2_center
+            # R_inv @ Current + (P2_center - P1_center) = P2_orig - P1_center (Target)
+            #
+            # So: R_inv = R^T, t_inv = P2_center - P1_center
+            
+            R_inv = rot_T.T
+            t_inv = p2_center - center
+
+            # Convert to numpy for storage
+            R_inv_np = R_inv.numpy().astype(np.float32)
+            t_inv_np = t_inv.numpy().astype(np.float32)
 
         data = {
             'name': name,
-            'R_inv': R_inv,
-            't_inv': t_inv,
-            'p1_residue': p1_residue,
-            'p2_residue': p2_residue,
-            'p1_coords_gt': protein1_coords_gt,  # C alpha coordinates
-            'p2_coords_gt': protein2_coords_gt,  # C alpha coordinates
-            'p1_coords': p1_coords,  # moved C alpha coordinates
-            'p2_coords': p2_coords,  # moved C alpha coordinates
-            # N coordinates
-            'p1_n_coords_gt': p1_n_coords_gt,
-            'p2_n_coords_gt': p2_n_coords_gt,
-            'p1_n_coords': p1_n_coords, # moved N coordinates
-            'p2_n_coords': p2_n_coords, # moved N coordinates
-            # C coordinates
-            'p1_c_coords_gt': p1_c_coords_gt,
-            'p2_c_coords_gt': p2_c_coords_gt,
-            'p1_c_coords': p1_c_coords, # moved C coordinates
-            'p2_c_coords': p2_c_coords, # moved C coordinates
-            'lig_seq': np.asarray(lig_Z, dtype=np.int32),
+            'R_inv': R_inv_np,  # Inverse rotation matrix to restore p2
+            't_inv': t_inv_np,  # Inverse translation vector to restore p2
+            'p1': p1,  # p1 structure dict
+            'p2': p2,  # p2 structure dict (after transformation)
+            'lig_seq': np.asarray(lig_full_element, dtype=np.int32),
             'lig_coords': np.asarray(lig_coords, dtype=np.float32), # moved ligand coordinates
-            'lig_coords_gt': np.asarray(lig_coords_gt, dtype=np.float32),
             'interface_flag': interface_flag,
         }
 
@@ -363,22 +350,130 @@ def construct_flow_matching_dataset(
 
     return dataset
 
+def filter_dataset_by_protein_length(dataset_path, output_path, min_length=50, max_length=700):
+    """
+    Filter dataset to keep only samples where both proteins have length between min_length and max_length
+    
+    Args:
+        dataset_path: Path to the input dataset
+        output_path: Path to save the filtered dataset
+        min_length: Minimum protein length to keep (default: 50)
+        max_length: Maximum protein length to keep (default: 500)
+    """
+    from datasets import load_from_disk
+    
+    print(f"Loading dataset from {dataset_path}...")
+    dataset = load_from_disk(dataset_path)
+    print(f"Original dataset size: {len(dataset)}")
+    print(f"Filtering criteria: {min_length} <= protein_length <= {max_length}")
+    
+    # Filter dataset
+    filtered_data = []
+    removed_count = 0
+    removed_too_short = 0
+    removed_too_long = 0
+    
+    for i, data in enumerate(tqdm(dataset, desc="Filtering dataset")):
+        # Get protein lengths
+        p1_length = len(data['p1']['aa']) if isinstance(data['p1']['aa'], (list, np.ndarray)) else data['p1']['aa'].shape[0]
+        p2_length = len(data['p2']['aa']) if isinstance(data['p2']['aa'], (list, np.ndarray)) else data['p2']['aa'].shape[0]
+        
+        # Check if both proteins are within the length range
+        p1_valid = min_length <= p1_length <= max_length
+        p2_valid = min_length <= p2_length <= max_length
+        
+        if p1_valid and p2_valid:
+            filtered_data.append(data)
+        else:
+            removed_count += 1
+            if not p1_valid:
+                if p1_length < min_length:
+                    removed_too_short += 1
+                else:
+                    removed_too_long += 1
+            if not p2_valid:
+                if p2_length < min_length:
+                    removed_too_short += 1
+                else:
+                    removed_too_long += 1
+    
+    print(f"\nFiltering complete:")
+    print(f"  Original size: {len(dataset)}")
+    print(f"  Filtered size: {len(filtered_data)}")
+    print(f"  Total removed: {removed_count} samples")
+    print(f"    - Too short (< {min_length}): {removed_too_short} samples")
+    print(f"    - Too long (> {max_length}): {removed_too_long} samples")
+    print(f"  Kept: {len(filtered_data)} samples ({(len(filtered_data)/len(dataset)*100):.2f}%)")
+    
+    # Create new dataset
+    filtered_dataset = Dataset.from_list(filtered_data)
+    
+    # Save filtered dataset
+    print(f"\nSaving filtered dataset to {output_path}...")
+    filtered_dataset = filtered_dataset.save_to_disk(output_path)
+    print(f"✓ Filtered dataset saved successfully!")
+    
+    return filtered_dataset
+
+def check_ligand(data_dir):
+    complexes = []
+    for entry in sorted(os.listdir(data_dir)):
+        complex_dir = os.path.join(data_dir, entry)
+        if os.path.isdir(complex_dir):
+            complexes.append(complex_dir)
+
+    for complex_dir in tqdm(complexes):
+        name = os.path.basename(complex_dir).split('_')[1]
+        lig_path = os.path.join(complex_dir, 'ligand_rcsb.sdf')
+        
+        if not os.path.exists(lig_path):
+            print(f"Warning: No ligand file found: {lig_path}")
+            continue
+
+        try:
+            ligand = parse_pdb_ligand(lig_path, heavy_only=True, mode='full')
+            print(ligand['element'])
+            print(ligand['aromatic_list'])
+            print(ligand['ligand_atom_feature_full'])
+            print(ligand['pos'])
+            print(f"Number of atoms: {len(ligand['pos'])}")
+            print(f"Number of atoms: {len(ligand['ligand_atom_feature_full'])}")
+            print(f"##################################")
+        except (rdkit.Chem.rdchem.AtomValenceException, ValueError) as e:
+            print(f"Error: {e}")
+            print(f"Ligand path: {lig_path}")
+            continue
+
 if __name__ == "__main__":
     # Construct interface modeling dataset.
     # dataset =construct_interface_modeling_dataset(
     #     data_dir="./data/TernaryDB/MGD_Train"
     # )
-    # dataset = dataset.save_to_disk("interface_modeling_dataset_v3")
+    # dataset = dataset.save_to_disk("interface_modeling_dataset_1208")
 
     # dataset = load_from_disk("interface_modeling_dataset_v2")
     # print(dataset)
     # print(len(dataset))
 
     # Construct flow matching dataset.
-    dataset = construct_flow_matching_dataset(
-        data_dir="./data/TernaryDB/MGD_Train"
+    # dataset = construct_flow_matching_dataset(
+    #     data_dir="./data/TernaryDB/MGD_Train", ligand_center=False
+    # )
+    # dataset = dataset.save_to_disk("TernaryDataset")
+    
+    # Filter dataset to keep only proteins with 50 <= length <= 500
+    filter_dataset_by_protein_length(
+        dataset_path="./data/Moloctite/TernaryDataset",
+        output_path="./data/Moloctite/TernaryDataset_filtered",
+        min_length=5,
+        max_length=700
     )
-    dataset = dataset.save_to_disk("flow_matching_dataset_v2")
+
+    # Test construct flow matching dataset v2.
+    # dataset = construct_flow_matching_dataset_v2(
+    #     data_dir="./data/TernaryDB/MGD_Train"
+    # )
+    # dataset = dataset.save_to_disk("flow_matching_dataset_v3")
 
     # Randomly print 10 samples and save to .log
     # dataset = load_from_disk("flow_matching_dataset_v1")
@@ -397,3 +492,6 @@ if __name__ == "__main__":
     #         f.write(json.dumps(sample_item, indent=2, default=default, ensure_ascii=False))
     #         f.write("\n\n")
     # print(f"Randomly printed {num_samples} samples and saved to random_samples.log")
+
+    # Check ligand.
+    # check_ligand(data_dir="./data/TernaryDB/MGD_Train")
