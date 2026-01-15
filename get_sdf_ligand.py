@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 # ================= Configuration Section =================
 # Modify this to your root directory path from the screenshot
-ROOT_DIR = "data/TernaryDB/MGD_Train" 
+ROOT_DIR = "data/TernaryDB/MGD_test" 
 
 # To avoid being blocked by RCSB, set a small request interval (seconds)
 SLEEP_TIME = 0.5 
