@@ -201,6 +201,82 @@ def get_layer_norm(layer_norm_type, dim):
         return nn.Identity()
 
 
+def batched_index_select(values, indices, dim=1):
+    """Select values using indices along a specific dimension."""
+    value_dims = values.shape[(dim + 1):]
+    values_shape, indices_shape = map(lambda t: list(t.shape), (values, indices))
+    indices = indices[(..., *((None,) * len(value_dims)))]
+    indices = indices.expand(*((-1,) * len(indices_shape)), *value_dims)
+    value_expand_len = len(indices_shape) - (dim + 1)
+    values = values[(*((slice(None),) * dim), *((None,) * value_expand_len), ...)]
+    
+    value_expand_shape = [-1] * len(values.shape)
+    expand_slice = slice(dim, (dim + value_expand_len))
+    value_expand_shape[expand_slice] = indices.shape[expand_slice]
+    values = values.expand(*value_expand_shape)
+    
+    dim += value_expand_len
+    return values.gather(dim, indices)
+
+
+def select_knn_neighbors(coors, num_nearest, cutoff, mask=None):
+    """
+    Select K nearest neighbors for each node based on distance.
+    
+    Args:
+        coors: (B, N, 3) - node coordinates
+        num_nearest: int - number of nearest neighbors to select
+        cutoff: float - distance cutoff (only neighbors within cutoff are considered)
+        mask: (B, N) - optional mask for valid nodes
+    
+    Returns:
+        nbhd_indices: (B, N, K) - indices of nearest neighbors
+        nbhd_mask: (B, N, K) - mask indicating valid neighbors
+        rel_dist: (B, N, K, 1) - distances to neighbors
+        rel_coors: (B, N, K, 3) - relative coordinates to neighbors
+    """
+    B, N, _ = coors.shape
+    device = coors.device
+    
+    # Compute relative coordinates and distances
+    rel_coors = rearrange(coors, 'b i d -> b i () d') - rearrange(coors, 'b j d -> b () j d')  # (B, N, N, 3)
+    rel_dist_sq = (rel_coors ** 2).sum(dim=-1, keepdim=True)  # (B, N, N, 1)
+    rel_dist = torch.sqrt(rel_dist_sq + 1e-8)  # (B, N, N, 1)
+    
+    # Create ranking for neighbor selection
+    ranking = rel_dist[..., 0].clone()  # (B, N, N)
+    
+    # Mask out invalid pairs
+    if mask is not None:
+        rank_mask = mask.unsqueeze(2) & mask.unsqueeze(1)  # (B, N, N)
+        ranking.masked_fill_(~rank_mask, 1e10)
+    
+    # Mask out self-connections
+    self_mask = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)  # (1, N, N)
+    ranking.masked_fill_(self_mask, 1e10)
+    
+    # Apply cutoff: mask out distances beyond cutoff
+    if cutoff < float('inf'):
+        ranking.masked_fill_(ranking > cutoff, 1e10)
+    
+    # Dynamically adjust num_nearest based on available nodes
+    max_available = N - 1
+    num_nearest = min(num_nearest, max_available)
+    num_nearest = max(1, num_nearest)  # Ensure at least 1 neighbor
+    
+    # Select top-K nearest neighbors
+    nbhd_ranking, nbhd_indices = ranking.topk(num_nearest, dim=-1, largest=False)  # (B, N, K)
+    
+    # Create mask for valid neighbors (within cutoff)
+    nbhd_mask = nbhd_ranking < cutoff
+    
+    # Select relative coordinates and distances for neighbors
+    rel_coors_selected = batched_index_select(rel_coors, nbhd_indices, dim=2)  # (B, N, K, 3)
+    rel_dist_selected = batched_index_select(rel_dist, nbhd_indices, dim=2)  # (B, N, K, 1)
+    
+    return nbhd_indices, nbhd_mask, rel_dist_selected, rel_coors_selected
+
+
 def compute_cross_attention(queries, keys, values, mask, cross_msgs=True):
     """
     Compute cross attention between two sets.
@@ -263,6 +339,8 @@ class IEGMN_Layer(nn.Module):
         leakyrelu_neg_slope=0.1,
         num_dist_basis=15,
         dist_sigma_base=1.5,
+        num_nearest_neighbors=16,  # number of nearest neighbors for KNN graph
+        cutoff=20.0,  # distance cutoff for neighbor selection
     ):
         super().__init__()
         
@@ -274,6 +352,8 @@ class IEGMN_Layer(nn.Module):
         self.x_connection_init = x_connection_init
         self.num_dist_basis = num_dist_basis
         self.dist_sigma_base = dist_sigma_base
+        self.num_nearest_neighbors = num_nearest_neighbors
+        self.cutoff = cutoff
         
         # Distance basis functions: exp(-||x_i - x_j||^2 / sigma)
         self.all_sigmas_dist = [dist_sigma_base ** x for x in range(num_dist_basis)]
@@ -371,64 +451,122 @@ class IEGMN_Layer(nn.Module):
         # ========== INTRA-SET MESSAGE PASSING ==========
         # Equation (5): m_{j→i} = φ^e(h_i, h_j, exp(-||x_i - x_j||^2/σ), f_{j→i})
         
-        # Compute edge features for set 1 (intra-set)
-        edge_feats1 = compute_edge_features(
-            coors1, coors1,
-            coors_N_i=coors_N1, coors_CA_i=coors_CA1, coors_C_i=coors_C1,
-            coors_N_j=coors_N1, coors_CA_j=coors_CA1, coors_C_j=coors_C1,
-            mask_i=mask1, mask_j=mask1,
+        # Select KNN neighbors for set 1
+        nbhd_indices1, nbhd_mask1, rel_dist1, rel_coors1 = select_knn_neighbors(
+            coors1, self.num_nearest_neighbors, self.cutoff, mask1
+        )  # nbhd_indices1: (B, N1, K), nbhd_mask1: (B, N1, K), rel_dist1: (B, N1, K, 1), rel_coors1: (B, N1, K, 3)
+        K1 = nbhd_indices1.shape[2]
+        
+        # Select neighbor features and coordinates for set 1
+        feats_j1_selected = batched_index_select(feats1, nbhd_indices1, dim=1)  # (B, N1, K1, d)
+        coors_j1_selected = batched_index_select(coors1, nbhd_indices1, dim=1)  # (B, N1, K1, 3)
+        coors_N_j1_selected = batched_index_select(coors_N1, nbhd_indices1, dim=1)  # (B, N1, K1, 3)
+        coors_CA_j1_selected = batched_index_select(coors_CA1, nbhd_indices1, dim=1)  # (B, N1, K1, 3)
+        coors_C_j1_selected = batched_index_select(coors_C1, nbhd_indices1, dim=1)  # (B, N1, K1, 3)
+        
+        # Expand coors_i to match selected neighbors: (B, N1, 3) -> (B, N1, K1, 3)
+        coors_i1_expanded = coors1.unsqueeze(2).expand(-1, -1, K1, -1)  # (B, N1, K1, 3)
+        coors_N_i1_expanded = coors_N1.unsqueeze(2).expand(-1, -1, K1, -1)  # (B, N1, K1, 3)
+        coors_CA_i1_expanded = coors_CA1.unsqueeze(2).expand(-1, -1, K1, -1)  # (B, N1, K1, 3)
+        coors_C_i1_expanded = coors_C1.unsqueeze(2).expand(-1, -1, K1, -1)  # (B, N1, K1, 3)
+        
+        # Actually, we need to compute edge features for each (i, j) pair where j is in neighbors of i
+        # Let's reshape to (B*N1*K1, 1, 3) for i and (B*N1*K1, 1, 3) for j
+        coors_i1_for_edges = coors_i1_expanded.reshape(B * N1 * K1, 1, 3)  # (B*N1*K1, 1, 3)
+        coors_j1_for_edges = coors_j1_selected.reshape(B * N1 * K1, 1, 3)  # (B*N1*K1, 1, 3)
+        coors_N_i1_for_edges = coors_N_i1_expanded.reshape(B * N1 * K1, 1, 3)
+        coors_CA_i1_for_edges = coors_CA_i1_expanded.reshape(B * N1 * K1, 1, 3)
+        coors_C_i1_for_edges = coors_C_i1_expanded.reshape(B * N1 * K1, 1, 3)
+        coors_N_j1_for_edges = coors_N_j1_selected.reshape(B * N1 * K1, 1, 3)
+        coors_CA_j1_for_edges = coors_CA_j1_selected.reshape(B * N1 * K1, 1, 3)
+        coors_C_j1_for_edges = coors_C_j1_selected.reshape(B * N1 * K1, 1, 3)
+        
+        # Compute edge features: (B*N1*K1, 1, 1, edge_feat_dim)
+        edge_feats1_flat = compute_edge_features(
+            coors_i1_for_edges, coors_j1_for_edges,
+            coors_N_i1_for_edges, coors_CA_i1_for_edges, coors_C_i1_for_edges,
+            coors_N_j1_for_edges, coors_CA_j1_for_edges, coors_C_j1_for_edges,
+            mask_i=None, mask_j=None,
             num_dist_basis=self.num_dist_basis,
             dist_sigma_base=self.dist_sigma_base
-        )  # (B, N1, N1, edge_feat_dim)
+        )  # (B*N1*K1, 1, 1, edge_feat_dim)
+        edge_feats1 = edge_feats1_flat.squeeze(1).squeeze(1).reshape(B, N1, K1, -1)  # (B, N1, K1, edge_feat_dim)
         
         if not self.use_dist_in_layers:
             # Zero out distance-based features if not using them
             edge_feats1[:, :, :, -len(self.all_sigmas_dist):] = 0.
         
-        # Prepare edge input for set 1
-        feats_i1 = rearrange(feats1, 'b i d -> b i () d')  # (B, N1, 1, d)
-        feats_j1 = rearrange(feats1, 'b j d -> b () j d')  # (B, 1, N1, d)
-        feats_i1, feats_j1 = torch.broadcast_tensors(feats_i1, feats_j1)  # (B, N1, N1, d)
+        # Prepare edge input for set 1 (only for selected neighbors)
+        feats_i1 = feats1.unsqueeze(2).expand(-1, -1, K1, -1)  # (B, N1, K1, d)
+        feats_j1 = feats_j1_selected  # (B, N1, K1, d)
         
-        edge_input1 = torch.cat([feats_i1, feats_j1, edge_feats1], dim=-1)  # (B, N1, N1, 2*d + edge_feat_dim)
+        edge_input1 = torch.cat([feats_i1, feats_j1, edge_feats1], dim=-1)  # (B, N1, K1, 2*d + edge_feat_dim)
         if edges1 is not None:
-            edge_input1 = torch.cat([edge_input1, edges1], dim=-1)
+            # Select edges for neighbors
+            edges1_selected = batched_index_select(edges1, nbhd_indices1, dim=2)  # (B, N1, K1, edge_dim)
+            edge_input1 = torch.cat([edge_input1, edges1_selected], dim=-1)
         
         # Compute messages for set 1
-        msg1 = self.edge_mlp(edge_input1)  # (B, N1, N1, out_feats_dim)
+        msg1 = self.edge_mlp(edge_input1)  # (B, N1, K1, out_feats_dim)
         
-        # Apply mask if provided
-        if mask1 is not None:
-            mask1_2d = mask1.unsqueeze(2) & mask1.unsqueeze(1)  # (B, N1, N1)
-            msg1 = msg1.masked_fill(~mask1_2d.unsqueeze(-1), 0.)
+        # Apply mask for valid neighbors
+        msg1 = msg1.masked_fill(~nbhd_mask1.unsqueeze(-1), 0.)
         
         # Same for set 2
-        edge_feats2 = compute_edge_features(
-            coors2, coors2,
-            coors_N_i=coors_N2, coors_CA_i=coors_CA2, coors_C_i=coors_C2,
-            coors_N_j=coors_N2, coors_CA_j=coors_CA2, coors_C_j=coors_C2,
-            mask_i=mask2, mask_j=mask2,
+        nbhd_indices2, nbhd_mask2, rel_dist2, rel_coors2 = select_knn_neighbors(
+            coors2, self.num_nearest_neighbors, self.cutoff, mask2
+        )  # nbhd_indices2: (B, N2, K), nbhd_mask2: (B, N2, K), rel_dist2: (B, N2, K, 1), rel_coors2: (B, N2, K, 3)
+        K2 = nbhd_indices2.shape[2]
+        
+        # Select neighbor features and coordinates for set 2
+        feats_j2_selected = batched_index_select(feats2, nbhd_indices2, dim=1)  # (B, N2, K2, d)
+        coors_j2_selected = batched_index_select(coors2, nbhd_indices2, dim=1)  # (B, N2, K2, 3)
+        coors_N_j2_selected = batched_index_select(coors_N2, nbhd_indices2, dim=1)  # (B, N2, K2, 3)
+        coors_CA_j2_selected = batched_index_select(coors_CA2, nbhd_indices2, dim=1)  # (B, N2, K2, 3)
+        coors_C_j2_selected = batched_index_select(coors_C2, nbhd_indices2, dim=1)  # (B, N2, K2, 3)
+        
+        # Expand coors_i to match selected neighbors
+        coors_i2_expanded = coors2.unsqueeze(2).expand(-1, -1, K2, -1)  # (B, N2, K2, 3)
+        coors_N_i2_expanded = coors_N2.unsqueeze(2).expand(-1, -1, K2, -1)
+        coors_CA_i2_expanded = coors_CA2.unsqueeze(2).expand(-1, -1, K2, -1)
+        coors_C_i2_expanded = coors_C2.unsqueeze(2).expand(-1, -1, K2, -1)
+        
+        # Reshape for compute_edge_features
+        coors_i2_for_edges = coors_i2_expanded.reshape(B * N2 * K2, 1, 3)  # (B*N2*K2, 1, 3)
+        coors_j2_for_edges = coors_j2_selected.reshape(B * N2 * K2, 1, 3)  # (B*N2*K2, 1, 3)
+        coors_N_i2_for_edges = coors_N_i2_expanded.reshape(B * N2 * K2, 1, 3)
+        coors_CA_i2_for_edges = coors_CA_i2_expanded.reshape(B * N2 * K2, 1, 3)
+        coors_C_i2_for_edges = coors_C_i2_expanded.reshape(B * N2 * K2, 1, 3)
+        coors_N_j2_for_edges = coors_N_j2_selected.reshape(B * N2 * K2, 1, 3)
+        coors_CA_j2_for_edges = coors_CA_j2_selected.reshape(B * N2 * K2, 1, 3)
+        coors_C_j2_for_edges = coors_C_j2_selected.reshape(B * N2 * K2, 1, 3)
+        
+        # Compute edge features for selected neighbors
+        edge_feats2_flat = compute_edge_features(
+            coors_i2_for_edges, coors_j2_for_edges,
+            coors_N_i2_for_edges, coors_CA_i2_for_edges, coors_C_i2_for_edges,
+            coors_N_j2_for_edges, coors_CA_j2_for_edges, coors_C_j2_for_edges,
+            mask_i=None, mask_j=None,
             num_dist_basis=self.num_dist_basis,
             dist_sigma_base=self.dist_sigma_base
-        )  # (B, N2, N2, edge_feat_dim)
+        )  # (B*N2*K2, 1, 1, edge_feat_dim)
+        edge_feats2 = edge_feats2_flat.squeeze(1).squeeze(1).reshape(B, N2, K2, -1)  # (B, N2, K2, edge_feat_dim)
         
         if not self.use_dist_in_layers:
-            # Zero out distance-based features if not using them
             edge_feats2[:, :, :, -len(self.all_sigmas_dist):] = 0.
         
-        feats_i2 = rearrange(feats2, 'b i d -> b i () d')
-        feats_j2 = rearrange(feats2, 'b j d -> b () j d')
-        feats_i2, feats_j2 = torch.broadcast_tensors(feats_i2, feats_j2)
+        feats_i2 = feats2.unsqueeze(2).expand(-1, -1, K2, -1)  # (B, N2, K2, d)
+        feats_j2 = feats_j2_selected  # (B, N2, K2, d)
         
         edge_input2 = torch.cat([feats_i2, feats_j2, edge_feats2], dim=-1)
         if edges2 is not None:
-            edge_input2 = torch.cat([edge_input2, edges2], dim=-1)
+            edges2_selected = batched_index_select(edges2, nbhd_indices2, dim=2)
+            edge_input2 = torch.cat([edge_input2, edges2_selected], dim=-1)
         
-        msg2 = self.edge_mlp(edge_input2)
+        msg2 = self.edge_mlp(edge_input2)  # (B, N2, K2, out_feats_dim)
         
-        if mask2 is not None:
-            mask2_2d = mask2.unsqueeze(2) & mask2.unsqueeze(1)
-            msg2 = msg2.masked_fill(~mask2_2d.unsqueeze(-1), 0.)
+        # Apply mask for valid neighbors
+        msg2 = msg2.masked_fill(~nbhd_mask2.unsqueeze(-1), 0.)
         
         # ========== CROSS-SET ATTENTION ==========
         # Equation (6): μ_{j→i} = a_{j→i} W h_j^{(l)}
@@ -462,19 +600,13 @@ class IEGMN_Layer(nn.Module):
         # Equation (9): x_i^{(l+1)} = ηx_i^{(0)} + (1-η)x_i^{(l)} + sum_j (x_i^{(l)} - x_j^{(l)}) φ^x(m_{j→i})
         
         # Compute coordinate update weights for set 1
-        edge_coef1 = self.coors_mlp(msg1)  # (B, N1, N1, 1) - φ^x(m_{j→i})
-        # Compute relative coordinates for coordinate update
-        rel_coors1 = rearrange(coors1, 'b i d -> b i () d') - rearrange(coors1, 'b j d -> b () j d')  # (B, N1, N1, 3)
-        x_moment1 = rel_coors1 * edge_coef1  # (B, N1, N1, 3) - (x_i - x_j) * φ^x(m_{j→i})
+        edge_coef1 = self.coors_mlp(msg1)  # (B, N1, K1, 1) - φ^x(m_{j→i})
+        # Use pre-computed relative coordinates
+        x_moment1 = rel_coors1 * edge_coef1  # (B, N1, K1, 3) - (x_i - x_j) * φ^x(m_{j→i})
         
         # Aggregate coordinate updates: mean over neighbors
-        if mask1 is not None:
-            mask1_2d = mask1.unsqueeze(2) & mask1.unsqueeze(1)
-            x_moment1 = x_moment1.masked_fill(~mask1_2d.unsqueeze(-1), 0.)
-            num_neighbors1 = mask1_2d.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N1, 1)
-            x_update1 = x_moment1.sum(dim=-2) / num_neighbors1  # (B, N1, 3)
-        else:
-            x_update1 = x_moment1.mean(dim=-2)  # (B, N1, 3)
+        num_neighbors1 = nbhd_mask1.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N1, 1)
+        x_update1 = x_moment1.sum(dim=-2) / num_neighbors1  # (B, N1, 3)
         
         # Apply coordinate update with skip connection
         coors1_out = (
@@ -484,18 +616,11 @@ class IEGMN_Layer(nn.Module):
         )
         
         # Same for set 2
-        edge_coef2 = self.coors_mlp(msg2)
-        # Compute relative coordinates for coordinate update
-        rel_coors2 = rearrange(coors2, 'b i d -> b i () d') - rearrange(coors2, 'b j d -> b () j d')  # (B, N2, N2, 3)
-        x_moment2 = rel_coors2 * edge_coef2
+        edge_coef2 = self.coors_mlp(msg2)  # (B, N2, K2, 1)
+        x_moment2 = rel_coors2 * edge_coef2  # (B, N2, K2, 3)
         
-        if mask2 is not None:
-            mask2_2d = mask2.unsqueeze(2) & mask2.unsqueeze(1)
-            x_moment2 = x_moment2.masked_fill(~mask2_2d.unsqueeze(-1), 0.)
-            num_neighbors2 = mask2_2d.sum(dim=-1, keepdim=True).clamp(min=1)
-            x_update2 = x_moment2.sum(dim=-2) / num_neighbors2
-        else:
-            x_update2 = x_moment2.mean(dim=-2)
+        num_neighbors2 = nbhd_mask2.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N2, 1)
+        x_update2 = x_moment2.sum(dim=-2) / num_neighbors2  # (B, N2, 3)
         
         coors2_out = (
             self.x_connection_init * orig_coors2 +
@@ -508,13 +633,8 @@ class IEGMN_Layer(nn.Module):
         # Equation (10): h_i^{(l+1)} = (1-β)h_i^{(l)} + βφ^h(h_i^{(l)}, m_i, μ_i, f_i)
         
         # Aggregate intra-set messages for set 1
-        if mask1 is not None:
-            mask1_2d = mask1.unsqueeze(2) & mask1.unsqueeze(1)
-            msg1 = msg1.masked_fill(~mask1_2d.unsqueeze(-1), 0.)
-            num_neighbors1 = mask1_2d.sum(dim=-1, keepdim=True).clamp(min=1)
-            aggr_msg1 = msg1.sum(dim=-2) / num_neighbors1  # (B, N1, out_feats_dim)
-        else:
-            aggr_msg1 = msg1.mean(dim=-2)  # (B, N1, out_feats_dim)
+        num_neighbors1 = nbhd_mask1.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N1, 1)
+        aggr_msg1 = msg1.sum(dim=-2) / num_neighbors1  # (B, N1, out_feats_dim)
         
         # Prepare node update input for set 1
         input_node_upd1 = torch.cat([
@@ -537,13 +657,8 @@ class IEGMN_Layer(nn.Module):
         feats1_out = self.final_h_layernorm_layer(node_upd1)
         
         # Same for set 2
-        if mask2 is not None:
-            mask2_2d = mask2.unsqueeze(2) & mask2.unsqueeze(1)
-            msg2 = msg2.masked_fill(~mask2_2d.unsqueeze(-1), 0.)
-            num_neighbors2 = mask2_2d.sum(dim=-1, keepdim=True).clamp(min=1)
-            aggr_msg2 = msg2.sum(dim=-2) / num_neighbors2
-        else:
-            aggr_msg2 = msg2.mean(dim=-2)
+        num_neighbors2 = nbhd_mask2.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, N2, 1)
+        aggr_msg2 = msg2.sum(dim=-2) / num_neighbors2  # (B, N2, out_feats_dim)
         
         input_node_upd2 = torch.cat([
             self.node_norm(feats2),
@@ -594,6 +709,8 @@ class IEGMN(nn.Module):
         dist_sigma_base=1.5,
         shared_layers=False,
         num_att_heads=4,  # number of attention heads for keypoint generation
+        num_nearest_neighbors=16,  # number of nearest neighbors for KNN graph
+        cutoff=20.0,  # distance cutoff for neighbor selection
     ):
         super().__init__()
         
@@ -621,6 +738,8 @@ class IEGMN(nn.Module):
                 leakyrelu_neg_slope=leakyrelu_neg_slope,
                 num_dist_basis=num_dist_basis,
                 dist_sigma_base=dist_sigma_base,
+                num_nearest_neighbors=num_nearest_neighbors,
+                cutoff=cutoff,
             )
         )
         
@@ -642,6 +761,8 @@ class IEGMN(nn.Module):
                 leakyrelu_neg_slope=leakyrelu_neg_slope,
                 num_dist_basis=num_dist_basis,
                 dist_sigma_base=dist_sigma_base,
+                num_nearest_neighbors=num_nearest_neighbors,
+                cutoff=cutoff,
             )
             for _ in range(1, depth):
                 self.layers.append(interm_layer)
@@ -664,6 +785,8 @@ class IEGMN(nn.Module):
                         leakyrelu_neg_slope=leakyrelu_neg_slope,
                         num_dist_basis=num_dist_basis,
                         dist_sigma_base=dist_sigma_base,
+                        num_nearest_neighbors=num_nearest_neighbors,
+                        cutoff=cutoff,
                     )
                 )
         

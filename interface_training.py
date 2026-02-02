@@ -13,7 +13,9 @@ import wandb
 from tqdm import tqdm
 
 from datasets import load_from_disk
-from models.interface_model import InterfaceModel
+from models.interface_model import InterfaceModel, MultiHeadInterfaceModel
+
+from utils.constants import PAD_RESIDUE_INDEX
 
 
 def set_seed(seed):
@@ -24,7 +26,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def pad_and_stack(sequences, pad_value=20.0):
+def pad_and_stack(sequences, pad_value=None):
     """Pad sequences to same length and stack into batch."""
     max_len = max(seq.shape[0] for seq in sequences)
     batch = sequences[0].new_full((len(sequences), max_len) + sequences[0].shape[1:], pad_value)
@@ -45,8 +47,8 @@ def collate_fn(batch):
     p2_coords = [torch.tensor(sample['p2_coords'], dtype=torch.float32) for sample in batch]
 
     # Pad and stack
-    p1_residue, p1_mask = pad_and_stack(p1_residue, pad_value=20.0)
-    p2_residue, p2_mask = pad_and_stack(p2_residue, pad_value=20.0)
+    p1_residue, p1_mask = pad_and_stack(p1_residue, pad_value=PAD_RESIDUE_INDEX)
+    p2_residue, p2_mask = pad_and_stack(p2_residue, pad_value=PAD_RESIDUE_INDEX)
     p1_coords, _ = pad_and_stack(p1_coords, pad_value=0.0)
     p2_coords, _ = pad_and_stack(p2_coords, pad_value=0.0)
 
@@ -81,18 +83,18 @@ def ellipsoid_loss(pred_i1, pred_i2, batch, use_kl=False, mu_scale=1.0, sigma_sc
 
         # Symmetrize
         sigma_pred = 0.5 * (sigma_pred + sigma_pred.transpose(-1, -2))
-        sigma_true = 0.5 * (sigma_true + sigma_true.transpose(-1, -2))
+        # sigma_true = 0.5 * (sigma_true + sigma_true.transpose(-1, -2))
 
         # Scale-normalize
-        mu_true_n = mu_true / mu_scale
-        sigma_true_n = sigma_true / sigma_scale
+        # mu_true_n = mu_true / mu_scale
+        # sigma_true_n = sigma_true / sigma_scale
 
-        mu_loss = F.mse_loss(mu_pred, mu_true_n)
+        mu_loss = F.mse_loss(mu_pred, mu_true)
 
         if use_kl:
-            I = torch.eye(3, device=sigma_true_n.device, dtype=sigma_true_n.dtype)
+            I = torch.eye(3, device=sigma_pred.device, dtype=sigma_pred.dtype)
             sigma_pred_n = sigma_pred + eps * I
-            sigma_true_n = sigma_true_n + eps * I
+            sigma_true_n = sigma_true + eps * I
             k = mu_pred.shape[1]
             sigma_true_inv = torch.linalg.inv(sigma_true_n)
             trace_term = torch.einsum("bij,bjk->bik", sigma_true_inv, sigma_pred_n).diagonal(dim1=-2, dim2=-1).sum(-1)
@@ -100,13 +102,14 @@ def ellipsoid_loss(pred_i1, pred_i2, batch, use_kl=False, mu_scale=1.0, sigma_sc
             cov_kl = 0.5 * (trace_term - k + logdet_term)
             sigma_loss = cov_kl.mean()
         else:
-            sigma_loss = F.mse_loss(sigma_pred, sigma_true_n)
+            sigma_loss = F.mse_loss(sigma_pred, sigma_true)
 
         return mu_loss + sigma_loss
 
     loss1 = single_loss(pred_i1, batch['i1_mu'], batch['i1_sigma'])
     loss2 = single_loss(pred_i2, batch['i2_mu'], batch['i2_sigma'])
-    return 0.5 * (loss1 + loss2)
+    # return 0.5 * (loss1 + loss2)
+    return loss1 + 0.7 * loss2
 
 
 def count_parameters(model: torch.nn.Module):
@@ -193,6 +196,53 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, epoch, args):
         'loss': total_loss / num_batches,
     }
 
+
+def validate_epoch(model, dataloader, loss_fn, device, epoch, args):
+    """Validate for one epoch."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    pbar = tqdm(dataloader, desc=f'Val Epoch {epoch}', disable=not args.local_rank == 0)
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(pbar):
+            # Move to device
+            batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v 
+                    for k, v in batch.items()}
+
+            # Forward pass
+            outputs = model(
+                batch['p1_residue'], batch['p1_coords'],
+                batch['p2_residue'], batch['p2_coords'],
+                p1_mask=batch['p1_mask'], p2_mask=batch['p2_mask']
+            )
+
+            # Compute losses using the ellipsoid loss function
+            loss = loss_fn(
+                outputs['i1_params'],
+                outputs['i2_params'],
+                batch,
+                use_kl=args.use_kl,
+                mu_scale=args.mu_scale,
+                sigma_scale=args.sigma_scale
+            )
+
+            # Accumulate stats
+            total_loss += loss.item()
+            num_batches += 1
+
+            # Update progress bar
+            if args.local_rank == 0:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}'
+                })
+
+    return {
+        'loss': total_loss / num_batches,
+    }
+
+
 def print_sample_predictions(model, dataloader, device, args, num_samples=3):
     """Randomly select samples and print model predictions vs ground truth ellipsoid parameters for both interfaces"""
     model.eval()
@@ -211,11 +261,11 @@ def print_sample_predictions(model, dataloader, device, args, num_samples=3):
         pred_i1 = outputs['i1_params']
         pred_i2 = outputs['i2_params']
 
-        # Denormalize predictions
-        i1_mu_pred = pred_i1[:, :3] * args.mu_scale
-        i1_sigma_pred = pred_i1[:, 3:].reshape(-1, 3, 3) * args.sigma_scale
-        i2_mu_pred = pred_i2[:, :3] * args.mu_scale
-        i2_sigma_pred = pred_i2[:, 3:].reshape(-1, 3, 3) * args.sigma_scale
+        # No denormalization since loss uses raw targets now
+        i1_mu_pred = pred_i1[:, :3]
+        i1_sigma_pred = pred_i1[:, 3:].reshape(-1, 3, 3)
+        i2_mu_pred = pred_i2[:, :3]
+        i2_sigma_pred = pred_i2[:, 3:].reshape(-1, 3, 3)
 
         i1_mu_true = batch['i1_mu']
         i1_sigma_true = batch['i1_sigma']
@@ -350,11 +400,12 @@ def main():
                        help='Path to dataset directory')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
+    parser.add_argument('--val_split', type=float, default=0.05, help='Validation split ratio (default: 0.05)')
     
     # Model arguments
     parser.add_argument('--model_dim', type=int, default=128, help='Model dimension')
     parser.add_argument('--model_depth', type=int, default=4, help='Model depth')
-    parser.add_argument('--num_tokens', type=int, default=21, help='Number of token types')
+    parser.add_argument('--num_tokens', type=int, default=22, help='Number of token types (21 amino acids + 1 padding)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
@@ -382,11 +433,18 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Debug mode')
 
     # Fixed scaling for ellipsoid loss and prediction
-    parser.add_argument('--mu_scale', type=float, default=64.0, help='Fixed scale for mu (center) used in loss and denormalization')
-    parser.add_argument('--sigma_scale', type=float, default=128.0, help='Fixed scale for sigma (covariance) used in loss and denormalization')
+    parser.add_argument('--mu_scale', type=float, default=128.0, help='Fixed scale for mu (center) used in loss and denormalization')
+    parser.add_argument('--sigma_scale', type=float, default=256.0, help='Fixed scale for sigma (covariance) used in loss and denormalization')
 
     # Loss options
     parser.add_argument('--use_kl', action='store_true', default=False, help='Use KL divergence for sigma term (default: False). If not set, use Frobenius MSE')
+
+    # Multi-head attention arguments
+    parser.add_argument('--num_att_heads', type=int, default=50, help='Number of attention heads')
+    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
+    parser.add_argument('--nonlin', type=str, default='leakyrelu', help='Nonlinearity for feature transformation')
+    parser.add_argument('--leakyrelu_neg_slope', type=float, default=0.1, help='Negative slope for LeakyReLU')
+    parser.add_argument('--num_nearest_neighbors', type=int, default=16, help='Number of nearest neighbors for KNN graph')
     
     args = parser.parse_args()
     
@@ -426,10 +484,21 @@ def main():
     # Load dataset
     dataset = load_from_disk(args.dataset_dir)
     
-    # Use the entire dataset for training (no validation split)
-    train_dataset = dataset
+    # Split dataset into train and validation
+    if args.val_split > 0:
+        split_result = dataset.train_test_split(test_size=args.val_split, shuffle=True, seed=args.seed)
+        train_dataset = split_result['train']
+        val_dataset = split_result['test']
+        if args.local_rank == 0:
+            print(f"Dataset split: {len(train_dataset)} train, {len(val_dataset)} validation")
+    else:
+        train_dataset = dataset
+        val_dataset = None
+        if args.local_rank == 0:
+            print(f"Using entire dataset for training: {len(train_dataset)} samples")
+
     
-    # Create data loader
+    # Create data loaders
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if args.world_size > 1 else None
     
     train_loader = DataLoader(
@@ -443,11 +512,36 @@ def main():
         drop_last=True
     )
     
+    val_loader = None
+    val_sampler = None
+    if val_dataset is not None:
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if args.world_size > 1 else None
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            drop_last=False
+        )
     # Create model
-    model = InterfaceModel(
+    # model = InterfaceModel(
+    #     num_tokens=args.num_tokens,
+    #     dim=args.model_dim,
+    #     depth=args.model_depth
+    # ).to(device)
+    model = MultiHeadInterfaceModel(
         num_tokens=args.num_tokens,
         dim=args.model_dim,
-        depth=args.model_depth
+        depth=args.model_depth,
+        num_att_heads=args.num_att_heads,
+        dropout=args.dropout,
+        nonlin=args.nonlin,
+        leakyrelu_neg_slope=args.leakyrelu_neg_slope,
+        num_nearest_neighbors=args.num_nearest_neighbors,
+        # cutoff=args.cutoff
     ).to(device)
 
     # Print and save model summary & parameter counts (before wrapping with DDP)
@@ -458,7 +552,7 @@ def main():
     
     # Create optimizer and scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.1)
     
     # Resume from checkpoint
     start_epoch = 0
@@ -476,18 +570,40 @@ def main():
         # Train for one epoch
         train_metrics = train_epoch(model, train_loader, optimizer, ellipsoid_loss, device, epoch, args)
         
+        # Validate if validation set exists
+        val_metrics = {}
+        if val_loader is not None:
+            val_metrics = validate_epoch(model, val_loader, ellipsoid_loss, device, epoch, args)
+        
         # Log metrics and print sample predictions
         if args.local_rank == 0:
+            # Prepare metrics for logging
+            log_metrics = {f'train/{k}': v for k, v in train_metrics.items()}
+            if val_metrics:
+                log_metrics.update({f'val/{k}': v for k, v in val_metrics.items()})
+            
             if not args.debug:
-                wandb.log(train_metrics, step=epoch)
-            print(f"Epoch {epoch}: {train_metrics}")
+                wandb.log(log_metrics, step=epoch)
+            
+            print(f"Epoch {epoch}: Train {train_metrics}", end='')
+            if val_metrics:
+                print(f", Val {val_metrics}")
+            else:
+                print()
             
             # Print sample predictions to monitor training progress
-            print_sample_predictions(model, train_loader, device, args, num_samples=3)
+            # print_sample_predictions(model, train_loader, device, args, num_samples=3)
+            if val_loader is not None:
+                print(f"##################################")
+                print_sample_predictions(model, val_loader, device, args, num_samples=3)
         
         # Save checkpoint periodically
         if epoch % args.save_freq == 0:
-            save_checkpoint(model, optimizer, scheduler, epoch, train_metrics, args)
+            # Include both train and val metrics in checkpoint
+            checkpoint_metrics = {**train_metrics}
+            if val_metrics:
+                checkpoint_metrics.update({f'val_{k}': v for k, v in val_metrics.items()})
+            save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_metrics, args)
         
         # Update learning rate scheduler
         scheduler.step()
