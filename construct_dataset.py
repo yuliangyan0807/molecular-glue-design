@@ -1,4 +1,5 @@
 import os
+import sys
 import random
 import numpy as np
 import torch
@@ -18,18 +19,6 @@ from utils.rigid_utils import parse_pdb, get_torsion_angle, parse_pdb_ligand
 from utils.constants import BBHeavyAtom
 from utils.training_utils import collate_fn
 
-from DeepTernary.deepternary.models.process_mols import (
-    distance_featurizer,
-    get_geometry_graph_ring,
-    get_lig_graph_revised,
-    get_rdkit_coords_v2,
-    get_rec_graph,
-    get_receptor_inference,
-    lig_atom_featurizer,
-    read_molecule,
-    rigid_transform_Kabsch_3D
-)
-from DeepTernary.deepternary.models.ternary_pdb import get_pocket_and_mask
 from DeepTernary.deepternary.models.geometry_utils import random_rotation_translation
 
 def read_ligand_pdb(pdb_path, sanitize=True, remove_hs=True, return_symbols=False):
@@ -195,7 +184,7 @@ def construct_flow_matching_dataset(
 
     dataset = []
 
-    interface_modeling_dataset = load_from_disk("interface_modeling_dataset_v2")
+    interface_modeling_dataset = load_from_disk("./data/Moloctite/interface_modeling_dataset_1208")
     complexes_with_interface = interface_modeling_dataset['name']
     print(f"Number of complexes with interface: {len(complexes_with_interface)}")
 
@@ -215,7 +204,18 @@ def construct_flow_matching_dataset(
         p1 = parse_pdb(p1_path)[0]
         p2 = parse_pdb(p2_path)[0]
 
-        # lig_Z, lig_coords = read_ligand_pdb(lig_path, sanitize=True, remove_hs=True)
+        p1_ca_coords = p1['pos_heavyatom'][:, BBHeavyAtom.CA, :]
+        p2_ca_coords = p2['pos_heavyatom'][:, BBHeavyAtom.CA, :]
+
+        
+        # Extract interface coordinates.
+        # if interface_flag:
+        #     _, p1_interface_mask, p2_interface_mask, p1_interface_residues, p2_interface_residues = get_interface_from_graphs(
+        #         p1_ca_coords, 
+        #         p2_ca_coords, 
+        #         cutoff=8.0 # 8.0 Å for C-alpha atoms cutoff distance.
+        #     )
+
         try: 
             lig = parse_pdb_ligand(lig_path, heavy_only=True, mode='full')
         except Exception as e:
@@ -232,49 +232,50 @@ def construct_flow_matching_dataset(
             center = np.sum(lig_coords, axis=0) / len(lig_coords)
             lig_coords = lig_coords - center
 
-            # print(p1['pos_heavyatom'])
-            # Move the protein to the center of the ligand.
+            center = torch.from_numpy(center).to(p1['pos_heavyatom'].dtype)
+
+            # Move p1 to the center of the ligand.
             p1['pos_heavyatom'] = p1['pos_heavyatom'] - center[None, None, :]
-            # print(p1['pos_heavyatom'])
-            p2['pos_heavyatom'] = p2['pos_heavyatom'] - center[None, None, :]
             # Calculate the torsion angles after translation.
             p1['torsion_angle'], p1['torsion_angle_mask'] = get_torsion_angle(p1['pos_heavyatom'], p1['aa'])
-            p2['torsion_angle'], p2['torsion_angle_mask'] = get_torsion_angle(p2['pos_heavyatom'], p2['aa'])
             
-            # Save original p2 coordinates before random transformation
-            # p2_pos_heavyatom_orig = p2['pos_heavyatom'].clone()
+            # Move p2 to its own center (centroid)
+            p2_ca_coords = p2['pos_heavyatom'][:, BBHeavyAtom.CA, :]  # [L, 3]
+            # p2_ca_coords_ligand_center = p2_ca_coords - center[None, :].numpy()
+            # if interface_flag:
+            #     p2_interface_coords = p2_ca_coords_ligand_center[p2_interface_mask]
+            #     p2_mu, p2_sigma = get_elilipsoid_for_interface(p2_interface_coords)
+            # else:
+            #     p2_interface_coords = p2_ca_coords_ligand_center[random.choice(range(len(p2_ca_coords_ligand_center)), 20)]
+            #     p2_mu, p2_sigma = get_elilipsoid_for_interface(p2_interface_coords)
             
-            # Randomly move p2: generate rotation matrix and translation vector
-            rot_T, rot_b = random_rotation_translation(translation_distance=5.0)
-            # rot_T: [3, 3] rotation matrix, rot_b: [3] translation vector
+            p2_center = torch.mean(p2_ca_coords, dim=0)  # [3]
+            p2['pos_heavyatom'] = p2['pos_heavyatom'] - p2_center[None, None, :]
+
             
-            # Extract CA coordinates to compute centroid
-            # pos_heavyatom shape: [L, A, 3], mask_heavyatom shape: [L, A]
-            p1_ca_coords = p1['pos_heavyatom'][:, BBHeavyAtom.CA, :]  # [L, 3]
-            mean_to_remove = p1_ca_coords.mean(dim=0, keepdim=True)  # [1, 3]
+            # Apply random rotation only (no translation)
+            rot_T, _ = random_rotation_translation(translation_distance=0.0)
+            # rot_T: [3, 3] rotation matrix
             
-            # Apply transformation to all heavy atoms
+            # Apply rotation to all heavy atoms
             # pos_heavyatom shape: [L, A, 3]
             L, A = p2['pos_heavyatom'].shape[:2]
             p2_coords_flat = p2['pos_heavyatom'].reshape(L * A, 3)  # [L*A, 3]
             
-            # Apply rotation and translation: X_moved = R @ (X_orig - mean) + t
-            # Inverse:X_orig = R^T @ X_moved + (mean - R^T @ t)
-            p2_coords_flat_transformed = (rot_T @ (p2_coords_flat - mean_to_remove.squeeze(0)).T).T + rot_b
+            # Apply rotation: X_rotated = R @ X_centered
+            p2_coords_flat_transformed = (rot_T @ p2_coords_flat.T).T
             p2['pos_heavyatom'] = p2_coords_flat_transformed.reshape(L, A, 3)
             
-            R = rot_T  # [3, 3]
-            t = rot_b  # [3]
-            R_inv = R.T  # [3, 3]
-            t_inv = (mean_to_remove.squeeze(0) - R_inv @ t.squeeze(0))  # [3]
+            # Calculate the torsion angles after transformation
+            p2['torsion_angle'], p2['torsion_angle_mask'] = get_torsion_angle(p2['pos_heavyatom'], p2['aa'])
             
-            # Simple verification: check if coordinates can be restored
-            # p2_coords_flat_orig = p2_pos_heavyatom_orig.reshape(L * A, 3)  # [L*A, 3]
-            # p2_coords_flat_restored = (R_inv @ p2_coords_flat_transformed.T).T + t_inv  # [L*A, 3]
-            # restoration_error = torch.abs(p2_coords_flat_restored - p2_coords_flat_orig).max().item()
-            # print(p2_coords_flat_orig)
-            # print(p2_coords_flat_restored)
-            # print(restoration_error)
+            # Calculate inverse transformation to restore p2 to correct position in complex
+            # Current: p2_rotated = R @ (p2_orig - p2_center)
+            # Target: p2_target = p2_orig - center (correct position relative to ligand center)
+            # So: p2_target = R^T @ p2_rotated + (p2_center - center)
+            R = rot_T  # [3, 3]
+            R_inv = R.T  # [3, 3]
+            t_inv = p2_center - center  # [3]
             
             # Convert to numpy for storage
             R_inv_np = R_inv.numpy().astype(np.float32)  # [3, 3]
@@ -444,12 +445,62 @@ def check_ligand(data_dir):
             print(f"Ligand path: {lig_path}")
             continue
 
+def check_translation(dataset):
+    trans = []
+    for data in tqdm(dataset):
+        tran = data['t_inv']
+        trans.append(tran)
+    
+    print(f"mean of translation: {np.mean(trans, axis=0)}")
+    print(f"std of translation: {np.std(trans, axis=0)}")
+
+def check_center(dataset):
+    val = []
+    for data in tqdm(dataset):
+        t_inv = data['t_inv']
+        # Convert to tensor if it's a list (HuggingFace datasets serializes tensors as lists)
+        if isinstance(t_inv, list):
+            t_inv = torch.tensor(t_inv)
+        
+        p1 = data['p1']
+        p2 = data['p2']
+        
+        # Convert pos_heavyatom to tensor if it's a list
+        p1_pos_heavyatom = p1['pos_heavyatom']
+        if isinstance(p1_pos_heavyatom, list):
+            p1_pos_heavyatom = torch.tensor(p1_pos_heavyatom)
+        
+        p2_pos_heavyatom = p2['pos_heavyatom']
+        if isinstance(p2_pos_heavyatom, list):
+            p2_pos_heavyatom = torch.tensor(p2_pos_heavyatom)
+        
+        p1_ca_coords = p1_pos_heavyatom[:, BBHeavyAtom.CA, :]
+        p2_ca_coords = p2_pos_heavyatom[:, BBHeavyAtom.CA, :]
+        p1_center = torch.mean(p1_ca_coords, axis=0)
+        p2_center = torch.mean(p2_ca_coords, axis=0)
+        print(f"t_inv: {t_inv}")
+        print(f"p1 center: {p1_center}")
+        print(f"p2 center: {p2_center}")
+        
+        lig_coords = data['lig_coords']
+        if isinstance(lig_coords, list):
+            lig_coords = torch.tensor(lig_coords)
+        lig_center = torch.mean(lig_coords, axis=0)
+        print(f"lig center: {lig_center}")
+        print(f"p2_center_original: {lig_center + t_inv}")
+        print(f"p2_center + p1_center: {p2_center + p1_center}")
+        val.append(p2_center + p1_center - t_inv)
+        print(f"####################################")
+
+    print(f"mean of val: {np.mean(val, axis=0)}")
+    print(f"std of val: {np.std(val, axis=0)}")
+
 if __name__ == "__main__":
     # Construct interface modeling dataset.
-    # dataset =construct_interface_modeling_dataset(
-    #     data_dir="./data/TernaryDB/MGD_Train"
-    # )
-    # dataset = dataset.save_to_disk("interface_modeling_dataset_1208")
+    dataset =construct_interface_modeling_dataset(
+        data_dir="./data/TernaryDB/MGD_test"
+    )
+    dataset = dataset.save_to_disk("interface_modeling_dataset_eval")
 
     # dataset = load_from_disk("interface_modeling_dataset_v2")
     # print(dataset)
@@ -457,23 +508,17 @@ if __name__ == "__main__":
 
     # Construct flow matching dataset.
     # dataset = construct_flow_matching_dataset(
-    #     data_dir="./data/TernaryDB/MGD_Train", ligand_center=False
+    #     data_dir="./data/TernaryDB/MGD_test", ligand_center=True
     # )
-    # dataset = dataset.save_to_disk("TernaryDataset")
+    # dataset = dataset.save_to_disk("TernaryDataset_test")
     
     # Filter dataset to keep only proteins with 50 <= length <= 500
-    filter_dataset_by_protein_length(
-        dataset_path="./data/Moloctite/TernaryDataset",
-        output_path="./data/Moloctite/TernaryDataset_filtered",
-        min_length=5,
-        max_length=700
-    )
-
-    # Test construct flow matching dataset v2.
-    # dataset = construct_flow_matching_dataset_v2(
-    #     data_dir="./data/TernaryDB/MGD_Train"
+    # filter_dataset_by_protein_length(
+    #     dataset_path="./data/Moloctite/TernaryDataset",
+    #     output_path="./data/Moloctite/TernaryDataset_filtered",
+    #     min_length=5,
+    #     max_length=700
     # )
-    # dataset = dataset.save_to_disk("flow_matching_dataset_v3")
 
     # Randomly print 10 samples and save to .log
     # dataset = load_from_disk("flow_matching_dataset_v1")
@@ -495,3 +540,8 @@ if __name__ == "__main__":
 
     # Check ligand.
     # check_ligand(data_dir="./data/TernaryDB/MGD_Train")
+
+    # dataset = load_from_disk("./data/Moloctite/TernaryDataset_filtered")
+    # check_center(dataset)
+
+    pass

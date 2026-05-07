@@ -11,7 +11,6 @@ from utils.rigid_utils import construct_3d_basis, global_to_local
 from openfold.utils import rigid_utils as ru
 from openfold.utils.rigid_utils import Rigid
 
-from utils.so3_utils import rotvec_to_rotmat
 from utils.constants import AA, BBHeavyAtom, max_num_heavyatoms, MAP_ATOM_TYPE_FULL_TO_INDEX
 from utils.rigid_utils import get_backbone_dihedral_angles, pairwise_dihedrals, kabsch_align
 
@@ -1294,463 +1293,14 @@ class PhiA(nn.Module):
 
         return phi_probs
 
-# class PhiRT(nn.Module):
-#     """
-#     Predicts rotation matrix R and translation vector t using features from proteins.
-#     Formula: 
-#         Δω = φ_R(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-#         Δt = φ_T(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-#         R̂₁ = exp([Δω]×) @ R*
-#         t̂₁ = Δt + t*
-#     """
-#     def __init__(self, c_s, c_t, hidden_dim, num_heads=4):
-#         super().__init__()
-#         self.c_s = c_s
-#         self.c_t = c_t
-#         self.hidden_dim = hidden_dim
-#         self.num_heads = num_heads
-        
-#         # MLP for delta_omega prediction (rotation vector)
-#         # Input: 2*hidden_dim (aggregated s1, s2)
-#         self.mlp_R_delta = nn.Sequential(
-#             nn.Linear(hidden_dim * 2, hidden_dim * 2),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim * 2, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, 3)  # Output rotation vector Δω in R^3
-#         )
-        
-#         # Keypoint generation layers (similar to interface_model.py)
-#         # Generate 2 keypoints for each protein
-#         self.num_keypoints = 20  # K = 20
-        
-#         # Feature transformation before computing mean (φ in the paper)
-#         self.mlp_h_mean_ROT = nn.Sequential(
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#         )
-        
-#         # Key projection: transforms features to keys for attention
-#         self.att_mlp_key_ROT = nn.Linear(hidden_dim, self.num_keypoints * hidden_dim, bias=False)
-        
-#         # Query projection: transforms mean features to queries for attention
-#         self.att_mlp_query_ROT = nn.Linear(hidden_dim, self.num_keypoints * hidden_dim, bias=False)
-
-#     def _generate_keypoints(self, feats1, coors1, feats2, coors2, mask1=None, mask2=None):
-#         """
-#         Generate K keypoints for each protein using cross-attention.
-#         Similar to interface_model.py _generate_keypoints method.
-        
-#         Args:
-#             feats1: (B, N1, d) - features for protein 1
-#             coors1: (B, N1, 3) - coordinates for protein 1
-#             feats2: (B, N2, d) - features for protein 2
-#             coors2: (B, N2, 3) - coordinates for protein 2
-#             mask1: (B, N1) - mask for protein 1 (optional)
-#             mask2: (B, N2) - mask for protein 2 (optional)
-        
-#         Returns:
-#             Y1: (B, K, 3) - keypoints for protein 1
-#             Y2: (B, K, 3) - keypoints for protein 2
-#             attn1: (B, K, N1) - attention weights for protein 1
-#             attn2: (B, K, N2) - attention weights for protein 2
-#         """
-#         B, N1, d = feats1.shape
-#         B, N2, d = feats2.shape
-#         K = self.num_keypoints
-        
-#         # Compute mean features μ(φ(H₁)) and μ(φ(H₂))
-#         # Apply transformation φ first
-#         feats1_transformed = self.mlp_h_mean_ROT(feats1)  # (B, N1, d)
-#         feats2_transformed = self.mlp_h_mean_ROT(feats2)  # (B, N2, d)
-        
-#         # Compute mean
-#         if mask1 is not None:
-#             mask1_expanded = mask1.unsqueeze(-1)  # (B, N1, 1)
-#             feats1_masked = feats1_transformed * mask1_expanded
-#             H1_mean = feats1_masked.sum(dim=1, keepdim=True) / (mask1.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-#         else:
-#             H1_mean = feats1_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-#         if mask2 is not None:
-#             mask2_expanded = mask2.unsqueeze(-1)  # (B, N2, 1)
-#             feats2_masked = feats2_transformed * mask2_expanded
-#             H2_mean = feats2_masked.sum(dim=1, keepdim=True) / (mask2.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-#         else:
-#             H2_mean = feats2_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-#         # Generate Y2 (keypoints for protein 2)
-#         # Query: μ(φ(H₁)) (mean of protein 1 features)
-#         # Keys: h₂ⱼ (each feature from protein 2)
-#         # Formula: βⱼᵏ = softmaxⱼ (¹/√ᵈ h₂ⱼᵀ W μ(φ(H₁)))
-#         keys_2 = self.att_mlp_key_ROT(feats2)  # (B, N2, K*d)
-#         keys_2 = keys_2.view(B, N2, K, d)  # (B, N2, K, d)
-#         keys_2 = keys_2.transpose(1, 2)  # (B, K, N2, d)
-        
-#         query_2 = self.att_mlp_query_ROT(H1_mean)  # (B, 1, K*d)
-#         query_2 = query_2.view(B, 1, K, d)  # (B, 1, K, d)
-#         query_2 = query_2.transpose(1, 2)  # (B, K, 1, d)
-#         query_2 = query_2.transpose(2, 3)  # (B, K, d, 1)
-        
-#         # Attention scores: (B, K, N2, 1)
-#         att_scores_2 = (keys_2 @ query_2) / math.sqrt(d)  # (B, K, N2, 1)
-        
-#         # Apply mask if provided
-#         if mask2 is not None:
-#             mask2_expanded = mask2.unsqueeze(1).unsqueeze(-1)  # (B, 1, N2, 1)
-#             mask2_expanded = mask2_expanded.expand(-1, K, -1, -1)  # (B, K, N2, 1)
-#             att_scores_2 = att_scores_2.masked_fill(~mask2_expanded.bool(), -1e9)
-        
-#         attn2 = F.softmax(att_scores_2.squeeze(-1), dim=-1)  # (B, K, N2)
-        
-#         # Compute Y2: weighted sum of coordinates
-#         # y₂ₖ := Σⱼ₌₁ᵐ βⱼᵏ z₂ⱼ
-#         Y2 = einsum(attn2, coors2, 'b k n2, b n2 d -> b k d')  # (B, K, 3)
-        
-#         # Generate Y1 (keypoints for protein 1)
-#         # Query: μ(φ(H₂)) (mean of protein 2 features)
-#         # Keys: h₁ᵢ (each feature from protein 1)
-#         # Formula: αᵢᵏ = softmaxᵢ (¹/√ᵈ h₁ᵢᵀ W μ(φ(H₂)))
-#         keys_1 = self.att_mlp_key_ROT(feats1)  # (B, N1, K*d)
-#         keys_1 = keys_1.view(B, N1, K, d)  # (B, N1, K, d)
-#         keys_1 = keys_1.transpose(1, 2)  # (B, K, N1, d)
-        
-#         query_1 = self.att_mlp_query_ROT(H2_mean)  # (B, 1, K*d)
-#         query_1 = query_1.view(B, 1, K, d)  # (B, 1, K, d)
-#         query_1 = query_1.transpose(1, 2)  # (B, K, 1, d)
-#         query_1 = query_1.transpose(2, 3)  # (B, K, d, 1)
-        
-#         # Attention scores: (B, K, N1, 1)
-#         att_scores_1 = (keys_1 @ query_1) / math.sqrt(d)  # (B, K, N1, 1)
-        
-#         # Apply mask if provided
-#         if mask1 is not None:
-#             mask1_expanded = mask1.unsqueeze(1).unsqueeze(-1)  # (B, 1, N1, 1)
-#             mask1_expanded = mask1_expanded.expand(-1, K, -1, -1)  # (B, K, N1, 1)
-#             att_scores_1 = att_scores_1.masked_fill(~mask1_expanded.bool(), -1e9)
-        
-#         attn1 = F.softmax(att_scores_1.squeeze(-1), dim=-1)  # (B, K, N1)
-        
-#         # Compute Y1: weighted sum of coordinates
-#         # y₁ₖ := Σᵢ₌₁ⁿ αᵢᵏ z₁ᵢ
-#         Y1 = einsum(attn1, coors1, 'b k n1, b n1 d -> b k d')  # (B, K, 3)
-        
-#         return Y1, Y2, attn1, attn2
-
-#     def forward(self, s1, p1_coords, s2, p2_coords, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2):
-#         """
-#         Args:
-#             s1: (B, N1, c_s) - protein 1 features
-#             s2: (B, N2, c_s) - protein 2 features
-#             p1_coords: (B, N1, 3) - protein 1 coordinates
-#             p2_coords: (B, N2, 3) - protein 2 coordinates (moved)
-#             R_star: (B, 3, 3) - initial rotation matrix from Kabsch
-#             t_star: (B, 3) - initial translation vector from Kabsch
-#             R_tilde: (B, 3, 3) - noised rotation matrix at timestep t
-#             t_tilde: (B, 3) - noised translation vector at timestep t
-#             t_emb: (B, c_t) or (B, 1, c_t) - time embedding
-#             p1_mask: (B, N1) - mask for protein 1 residues
-#             p2_mask: (B, N2) - mask for protein 2 residues
-#             sigma_1: (B, 3, 3) - optional interface representation for protein 1
-#             sigma_2: (B, 3, 3) - optional interface representation for protein 2
-        
-#         Returns:
-#             R_pred: (B, 3, 3) - predicted rotation matrix R̂₁
-#             t_pred: (B, 3) - predicted translation vector t̂₁
-#         """
-#         B, N1, _ = s1.shape
-#         N2 = s2.shape[1]
-        
-#         # Generate keypoints using cross-attention
-#         # Y1: (B, K, 3) - keypoints for protein 1
-#         # Y2: (B, K, 3) - keypoints for protein 2
-#         Y1, Y2, attn1, attn2 = self._generate_keypoints(
-#             s1, p1_coords,
-#             s2, p2_coords,
-#             p1_mask, p2_mask
-#         )
-#         _, K, _ = Y2.shape
-        
-#         t_pred = Y1.mean(dim=1) + Y2.mean(dim=1)  # (B, 3)
-
-#         # Aggregate s1, s2 and predict delta_omega
-#         s1_mean = s1.mean(dim=1)  # (B, c_s)
-#         s2_mean = s2.mean(dim=1)  # (B, c_s)
-#         delta_omega = self.mlp_R_delta(torch.cat([s1_mean, s2_mean], dim=-1))  # (B, 3)
-#         # Compute ΔR = exp([Δω]×) using exponential map
-#         R_pred = rotvec_to_rotmat(delta_omega)  # (B, 3, 3)
-        
-#         return R_pred, t_pred
-
-class PhiRTIterative(nn.Module):
-    """
-    Predicts rotation matrix R and translation vector t using features from proteins.
-    Formula: 
-        Δω = φ_R(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-        Δt = φ_T(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-        R̂₁ = exp([Δω]×) @ R*
-        t̂₁ = Δt + t*
-    """
-    def __init__(self, c_s, c_t, hidden_dim, num_heads=4):
-        super().__init__()
-        self.c_s = c_s
-        self.c_t = c_t
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.num_refine_steps = 5
-        self.feat_dim = c_s
-        self.num_keypoints = 50  # Keypoint numbers
-        
-        # Project s1/s2 then compute cross-attention context.
-        self.proj_s1 = nn.Linear(c_s, hidden_dim)
-        self.proj_s2 = nn.Linear(c_s, hidden_dim)
-        self.cross_attn_rt = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
-
-        # Use cross-attention context to predict keypoint weights for Y1/Y2.
-        self.y1_weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.num_keypoints)
-        )
-        self.y2_weight_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.num_keypoints)
-        )
-
-        # Iterative residual head for [rot6d, delta_t].
-        # Input: relative weighted coordinate (y1_weighted - y2_weighted), 3D
-        self.mlp_rt_delta = nn.Sequential(
-            nn.Linear(3, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 9)  # [rot6d(6), delta_t(3)]
-        )
-        
-        # Feature transformation before computing mean (φ in the paper)
-        self.mlp_h_mean_ROT = nn.Sequential(
-            nn.Linear(self.feat_dim, self.feat_dim),
-            nn.ReLU(),
-        )
-        
-        # Key projection: transforms features to keys for attention
-        self.att_mlp_key_ROT = nn.Linear(self.feat_dim, self.num_keypoints * self.feat_dim, bias=False)
-        
-        # Query projection: transforms mean features to queries for attention
-        self.att_mlp_query_ROT = nn.Linear(self.feat_dim, self.num_keypoints * self.feat_dim, bias=False)
-
-    def _masked_mean(self, x, mask):
-        """Masked mean over sequence dimension."""
-        if mask is None:
-            return x.mean(dim=1)
-        mask = mask.float().unsqueeze(-1)
-        denom = mask.sum(dim=1).clamp_min(1e-6)
-        return (x * mask).sum(dim=1) / denom
-
-    def _rot6d_to_rotmat(self, rot_6d):
-        """Convert 6D rotation representation to rotation matrix."""
-        # rot_6d: (B, 6)
-        a1 = rot_6d[:, 0:3]
-        a2 = rot_6d[:, 3:6]
-
-        b1 = F.normalize(a1, dim=-1)
-        # Remove b1 component from a2, then normalize (Gram-Schmidt).
-        proj = (b1 * a2).sum(dim=-1, keepdim=True) * b1
-        b2 = F.normalize(a2 - proj, dim=-1)
-        b3 = torch.cross(b1, b2, dim=-1)
-
-        # Assemble columns to get (B, 3, 3).
-        return torch.stack([b1, b2, b3], dim=-1)
-
-    def _generate_keypoints(self, feats1, coors1, feats2, coors2, mask1=None, mask2=None):
-        """
-        Generate K keypoints for each protein using cross-attention.
-        Similar to interface_model.py _generate_keypoints method.
-        
-        Args:
-            feats1: (B, N1, d) - features for protein 1
-            coors1: (B, N1, 3) - coordinates for protein 1
-            feats2: (B, N2, d) - features for protein 2
-            coors2: (B, N2, 3) - coordinates for protein 2
-            mask1: (B, N1) - mask for protein 1 (optional)
-            mask2: (B, N2) - mask for protein 2 (optional)
-        
-        Returns:
-            Y1: (B, K, 3) - keypoints for protein 1
-            Y2: (B, K, 3) - keypoints for protein 2
-            attn1: (B, K, N1) - attention weights for protein 1
-            attn2: (B, K, N2) - attention weights for protein 2
-        """
-        B, N1, d = feats1.shape
-        B, N2, d = feats2.shape
-        K = self.num_keypoints
-        
-        # Compute mean features μ(φ(H₁)) and μ(φ(H₂))
-        # Apply transformation φ first
-        feats1_transformed = self.mlp_h_mean_ROT(feats1)  # (B, N1, d)
-        feats2_transformed = self.mlp_h_mean_ROT(feats2)  # (B, N2, d)
-        
-        # Compute mean
-        if mask1 is not None:
-            mask1_expanded = mask1.unsqueeze(-1)  # (B, N1, 1)
-            feats1_masked = feats1_transformed * mask1_expanded
-            H1_mean = feats1_masked.sum(dim=1, keepdim=True) / (mask1.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-        else:
-            H1_mean = feats1_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-        if mask2 is not None:
-            mask2_expanded = mask2.unsqueeze(-1)  # (B, N2, 1)
-            feats2_masked = feats2_transformed * mask2_expanded
-            H2_mean = feats2_masked.sum(dim=1, keepdim=True) / (mask2.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-        else:
-            H2_mean = feats2_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-        # Generate Y2 (keypoints for protein 2)
-        # Query: μ(φ(H₁)) (mean of protein 1 features)
-        # Keys: h₂ⱼ (each feature from protein 2)
-        # Formula: βⱼᵏ = softmaxⱼ (¹/√ᵈ h₂ⱼᵀ W μ(φ(H₁)))
-        keys_2 = self.att_mlp_key_ROT(feats2)  # (B, N2, K*d)
-        keys_2 = keys_2.view(B, N2, K, d)  # (B, N2, K, d)
-        keys_2 = keys_2.transpose(1, 2)  # (B, K, N2, d)
-        
-        query_2 = self.att_mlp_query_ROT(H1_mean)  # (B, 1, K*d)
-        query_2 = query_2.view(B, 1, K, d)  # (B, 1, K, d)
-        query_2 = query_2.transpose(1, 2)  # (B, K, 1, d)
-        query_2 = query_2.transpose(2, 3)  # (B, K, d, 1)
-        
-        # Attention scores: (B, K, N2, 1)
-        att_scores_2 = (keys_2 @ query_2) / math.sqrt(d)  # (B, K, N2, 1)
-        
-        # Apply mask if provided
-        if mask2 is not None:
-            mask2_expanded = mask2.unsqueeze(1).unsqueeze(-1)  # (B, 1, N2, 1)
-            mask2_expanded = mask2_expanded.expand(-1, K, -1, -1)  # (B, K, N2, 1)
-            att_scores_2 = att_scores_2.masked_fill(~mask2_expanded.bool(), -1e9)
-        
-        attn2 = F.softmax(att_scores_2.squeeze(-1), dim=-1)  # (B, K, N2)
-        
-        # Compute Y2: weighted sum of coordinates
-        # y₂ₖ := Σⱼ₌₁ᵐ βⱼᵏ z₂ⱼ
-        Y2 = einsum(attn2, coors2, 'b k n2, b n2 d -> b k d')  # (B, K, 3)
-        
-        # Generate Y1 (keypoints for protein 1)
-        # Query: μ(φ(H₂)) (mean of protein 2 features)
-        # Keys: h₁ᵢ (each feature from protein 1)
-        # Formula: αᵢᵏ = softmaxᵢ (¹/√ᵈ h₁ᵢᵀ W μ(φ(H₂)))
-        keys_1 = self.att_mlp_key_ROT(feats1)  # (B, N1, K*d)
-        keys_1 = keys_1.view(B, N1, K, d)  # (B, N1, K, d)
-        keys_1 = keys_1.transpose(1, 2)  # (B, K, N1, d)
-        
-        query_1 = self.att_mlp_query_ROT(H2_mean)  # (B, 1, K*d)
-        query_1 = query_1.view(B, 1, K, d)  # (B, 1, K, d)
-        query_1 = query_1.transpose(1, 2)  # (B, K, 1, d)
-        query_1 = query_1.transpose(2, 3)  # (B, K, d, 1)
-        
-        # Attention scores: (B, K, N1, 1)
-        att_scores_1 = (keys_1 @ query_1) / math.sqrt(d)  # (B, K, N1, 1)
-        
-        # Apply mask if provided
-        if mask1 is not None:
-            mask1_expanded = mask1.unsqueeze(1).unsqueeze(-1)  # (B, 1, N1, 1)
-            mask1_expanded = mask1_expanded.expand(-1, K, -1, -1)  # (B, K, N1, 1)
-            att_scores_1 = att_scores_1.masked_fill(~mask1_expanded.bool(), -1e9)
-        
-        attn1 = F.softmax(att_scores_1.squeeze(-1), dim=-1)  # (B, K, N1)
-        
-        # Compute Y1: weighted sum of coordinates
-        # y₁ₖ := Σᵢ₌₁ⁿ αᵢᵏ z₁ᵢ
-        Y1 = einsum(attn1, coors1, 'b k n1, b n1 d -> b k d')  # (B, K, 3)
-        
-        return Y1, Y2, attn1, attn2
-
-    def forward(self, Y1, Y2, s1, p1_coords, s2, p2_coords, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2):
-        """
-        Args:
-            s1: (B, N1, c_s) - protein 1 features
-            s2: (B, N2, c_s) - protein 2 features
-            p1_coords: (B, N1, 3) - protein 1 coordinates
-            p2_coords: (B, N2, 3) - protein 2 coordinates (moved)
-            R_star: (B, 3, 3) - initial rotation matrix from Kabsch
-            t_star: (B, 3) - initial translation vector from Kabsch
-            R_tilde: (B, 3, 3) - noised rotation matrix at timestep t
-            t_tilde: (B, 3) - noised translation vector at timestep t
-            t_emb: (B, c_t) or (B, 1, c_t) - time embedding
-            p1_mask: (B, N1) - mask for protein 1 residues
-            p2_mask: (B, N2) - mask for protein 2 residues
-            sigma_1: (B, 3, 3) - optional interface representation for protein 1
-            sigma_2: (B, 3, 3) - optional interface representation for protein 2
-        
-        Returns:
-            R_pred: (B, 3, 3) - predicted rotation matrix R̂₁
-            t_pred: (B, 3) - predicted translation vector t̂₁
-        """
-        B = s1.shape[0]
-        # Keep R_tilde / t_tilde / t_emb in the signature for compatibility,
-        # but the iterative PhiRT no longer depends on them internally.
-        t_curr = t_star
-        R_curr = R_star
-        
-        # Build cross-attention context from projected s1/s2 features.
-        s1_proj = self.proj_s1(s1)  # (B, N1, hidden_dim)
-        s2_proj = self.proj_s2(s2)  # (B, N2, hidden_dim)
-        p1_pad_mask = ~p1_mask.bool() if p1_mask is not None else None
-        p2_pad_mask = ~p2_mask.bool() if p2_mask is not None else None
-
-        s1_cross, _ = self.cross_attn_rt(
-            query=s1_proj, key=s2_proj, value=s2_proj, key_padding_mask=p2_pad_mask
-        )  # (B, N1, hidden_dim)
-        s2_cross, _ = self.cross_attn_rt(
-            query=s2_proj, key=s1_proj, value=s1_proj, key_padding_mask=p1_pad_mask
-        )  # (B, N2, hidden_dim)
-
-        s1_ctx = self._masked_mean(s1_cross, p1_mask)  # (B, hidden_dim)
-        s2_ctx = self._masked_mean(s2_cross, p2_mask)  # (B, hidden_dim)
-        p2_coords_curr = p2_coords
-
-        for _ in range(self.num_refine_steps):
-            # Predict attention weights over virtual keypoints from cross-attention context.
-            y1_logits = self.y1_weight_head(s1_ctx)  # (B, K)
-            y2_logits = self.y2_weight_head(s2_ctx)  # (B, K)
-            y1_weights = F.softmax(y1_logits, dim=-1)
-            y2_weights = F.softmax(y2_logits, dim=-1)
-            y1_weighted = torch.einsum('bk,bkd->bd', y1_weights, Y1)  # (B, 3)
-            y2_weighted = torch.einsum('bk,bkd->bd', y2_weights, Y2)  # (B, 3)
-
-            rt_input = y1_weighted + y2_weighted  # (B, 3)
-            delta_rt = self.mlp_rt_delta(rt_input)
-            rot_6d = delta_rt[:, :6]
-            delta_t = delta_rt[:, 6:]
-
-            R_delta = self._rot6d_to_rotmat(rot_6d)
-            R_curr = R_delta @ R_curr
-            # Keep (R, t) composition consistent with x' = x @ R^T + t.
-            t_curr = (t_curr.unsqueeze(1) @ R_delta.transpose(1, 2)).squeeze(1) + delta_t
-
-            # Alternate update: move protein-2 coordinates and regenerate virtual interface nodes.
-            p2_coords_curr = p2_coords_curr @ R_delta.transpose(1, 2) + delta_t.unsqueeze(1)
-            Y1, Y2, _, _ = self._generate_keypoints(
-                s1, p1_coords,
-                s2, p2_coords_curr,
-                p1_mask, p2_mask
-            )
-
-        return R_curr, t_curr
-
-
 class PhiRT(nn.Module):
     """
-    Simple baseline PhiRT that predicts R_inv and t_inv using only
-    global interface geometry:
+    Lightweight PhiRT that predicts R_inv and t_inv using global interface
+    geometry plus current noisy state/time context:
         - R_star, t_star from Kabsch on (Y1, Y2)
         - approximate mu1, mu2 as means of Y1, Y2
-    It keeps the same input signature as the iterative PhiRT so it can be
-    dropped in without changing call sites, but internally ignores
-    most high-dimensional inputs.
+        - R_tilde, t_tilde (current noisy rigid state)
+        - t_emb (projected global timestep embedding)
     """
 
     def __init__(self, c_s, c_t, hidden_dim, num_heads: int = 4):
@@ -1758,8 +1308,9 @@ class PhiRT(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # Input: [flatten(R_star), t_star, mu1, mu2]  -> dim = 9 + 3 + 3 + 3 = 18
-        in_dim = 9 + 3 + 3 + 3
+        # Input: [flatten(R_*), t_*, mu1, mu2, flatten(R_tilde), t_tilde, t_ctx]
+        # dim = 9 + 3 + 3 + 3 + 9 + 3 + 3 = 33
+        in_dim = 33
 
         self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -1767,355 +1318,285 @@ class PhiRT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        self.rot_head = nn.Linear(hidden_dim, 6)  # 6D rotation representation
+        # Initial global prediction heads
+        self.rot_head = nn.Linear(hidden_dim, 6)   # 6D rotation representation
         self.trans_head = nn.Linear(hidden_dim, 3)  # translation vector
+
+        # Per-step refinement blocks, similar in spirit to GAEncoder trunk blocks.
+        self.num_refine_steps = 2
+        self.enc = nn.ModuleDict()
+        self.rot_head_refine = nn.ModuleDict()
+        self.trans_head_refine = nn.ModuleDict()
+        for b in range(self.num_refine_steps):
+            self.enc[f"encoder_{b}"] = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+            self.rot_head_refine[f"rot_head_{b}"] = nn.Linear(hidden_dim, 6)
+            self.trans_head_refine[f"trans_head_{b}"] = nn.Linear(hidden_dim, 3)
+
+        # Project global timestep context to a compact 3D feature.
+        self.t_proj = nn.Linear(c_t, 3)
 
     @staticmethod
     def _rot6d_to_rotmat(rot_6d: torch.Tensor) -> torch.Tensor:
-        """
-        Convert 6D rotation representation to a 3x3 rotation matrix.
-        Same convention as in PhiRTIterative.
-        """
+        """Convert 6D rotation representation to rotation matrix (columns)."""
         a1 = rot_6d[:, 0:3]
         a2 = rot_6d[:, 3:6]
-
         b1 = F.normalize(a1, dim=-1)
         proj = (b1 * a2).sum(dim=-1, keepdim=True) * b1
         b2 = F.normalize(a2 - proj, dim=-1)
         b3 = torch.cross(b1, b2, dim=-1)
-
         return torch.stack([b1, b2, b3], dim=-1)
 
-    def forward(
-        self,
-        Y1,
-        Y2,
-        s1,
-        p1_coords,
-        s2,
-        p2_coords,
-        R_star,
-        t_star,
-        R_tilde,
-        t_tilde,
-        t_emb,
-        p1_mask,
-        p2_mask,
-        sigma_1,
-        sigma_2,
-    ):
+    def forward(self, Y1, Y2, s1, p1_coords, s2, p2_coords, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2):
         """
         Args:
             Y1, Y2: (B, K, 3) interface keypoints for protein 1 and 2
             R_star: (B, 3, 3) initial rotation from Kabsch on (Y1, Y2)
             t_star: (B, 3) initial translation from Kabsch
-            Other arguments are accepted for API compatibility but are ignored.
-
+            R_tilde: (B, 3, 3) or (B, 1, 3, 3), current noisy rotation state
+            t_tilde: (B, 3) or (B, 1, 3), current noisy translation state
+            t_emb: (B, N, c_t), per-token timestep embedding
+        
         Returns:
             R_pred: (B, 3, 3) predicted rotation matrix (R_inv)
             t_pred: (B, 3)   predicted translation vector (t_inv)
         """
         B = R_star.shape[0]
 
+        mask = p2_mask.float()                       # (B, N2)
+        mask_sum = mask.sum(dim=1, keepdim=True)    # (B, 1)
+        mask_sum = mask_sum.clamp(min=1e-6)
+
         # Approximate mu1, mu2 as the means of Y1 and Y2.
         # Shapes: (B, 3)
         mu1 = Y1.mean(dim=1)
         mu2 = Y2.mean(dim=1)
 
-        # Flatten R_star and build input feature.
+        # Build global context from timestep embedding.
+        t_ctx = self.t_proj(t_emb.mean(dim=1))  # (B, 3)
+
+        # Flatten rigid states and build input feature.
         R_flat = R_star.reshape(B, 9)
-        x = torch.cat([R_flat, t_star, mu1, mu2], dim=-1)  # (B, 18)
+        R_tilde_flat = R_tilde.reshape(B, 9)
+        t_tilde_flat = t_tilde.reshape(B, 3)
+        x = torch.cat([R_flat, t_star, mu1, mu2, R_tilde_flat, t_tilde_flat, t_ctx], dim=-1)  # (B, 33)
+
 
         h = self.trunk(x)
         rot_6d = self.rot_head(h)
         t_pred = self.trans_head(h)
 
         R_pred = self._rot6d_to_rotmat(rot_6d)
+
+        # Iterative refinement block
+        for b in range(self.num_refine_steps):
+            p2_coords = p2_coords @ R_pred.transpose(1, 2) + t_pred.unsqueeze(1)
+
+            mu1 = Y1.mean(dim=1)
+            mu2 = (p2_coords * mask.unsqueeze(-1)).sum(dim=1) / mask_sum
+
+            x = torch.cat(
+                [R_pred.reshape(B, 9), t_pred, mu1, mu2, R_tilde_flat, t_tilde_flat, t_ctx],
+                dim=-1
+            )
+
+            h = self.enc[f"encoder_{b}"](x)
+
+            t_pred_delta = self.trans_head_refine[f"trans_head_{b}"](h)
+
+            rot_6d = self.rot_head_refine[f"rot_head_{b}"](h)
+            R_pred_delta = self._rot6d_to_rotmat(rot_6d)
+
+            R_pred = R_pred @ R_pred_delta
+            t_pred = t_pred + t_pred_delta
+
         return R_pred, t_pred
 
-# class PhiRT(nn.Module):
-#     """
-#     Predicts rotation matrix R and translation vector t using features from proteins.
-#     Formula: 
-#         Δω = φ_R(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-#         Δt = φ_T(s1, s2, p1_coords, p2_coords, R*, t*, Σ_1, Σ_2, t_emb)
-#         R̂₁ = exp([Δω]×) @ R*
-#         t̂₁ = Δt + t*
-#     """
-#     def __init__(self, c_s, c_t, hidden_dim, num_heads=4):
-#         super().__init__()
-#         self.c_s = c_s
-#         self.c_t = c_t
-#         self.hidden_dim = hidden_dim
-#         self.num_heads = num_heads
-#         self.num_refine_steps = 50
-#         self.feat_dim = c_s
-#         self.num_keypoints = 50  # Keypoint numbers
-        
-#         # Project s1/s2 then compute cross-attention context.
-#         self.proj_s1 = nn.Linear(c_s, hidden_dim)
-#         self.proj_s2 = nn.Linear(c_s, hidden_dim)
-#         self.cross_attn_rt = nn.MultiheadAttention(
-#             embed_dim=hidden_dim,
-#             num_heads=num_heads,
-#             batch_first=True
-#         )
+class BackboneUpdateLocal(nn.Module):
+    """
+    Lightweight backbone update head: maps single representation to a 6D rigid update
+    (3D quaternion update vector + 3D translation update), to be applied via
+    Rigid.compose_q_update_vec.
+    """
 
-#         # Use cross-attention context to predict keypoint weights for Y1/Y2.
-#         self.y1_weight_head = nn.Sequential(
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, self.num_keypoints)
-#         )
-#         self.y2_weight_head = nn.Sequential(
-#             nn.Linear(hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, self.num_keypoints)
-#         )
+    def __init__(self, c_s: int):
+        super().__init__()
+        self.linear = Linear(c_s, 6, init="final")
 
-#         # Shared trunk + separate heads for rotation and translation
-#         self.rt_trunk = nn.Sequential(
-#             nn.Linear(3, hidden_dim * 2),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim * 2, hidden_dim),
-#             nn.ReLU(),
-#         )
-#         self.rot_head = nn.Linear(hidden_dim, 6)   # 6D rotation
-#         self.trans_head = nn.Linear(hidden_dim, 3)  # delta_t
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        # s: (B, N, C_s) -> update: (B, N, 6)
+        return self.linear(s)
 
-#         # Project t_tilde / R_tilde to hidden_dim so they can be cat with t_emb (after mean)
-#         self.proj_t_tilde = nn.Linear(3, hidden_dim)
-#         self.proj_R_tilde = nn.Linear(6, hidden_dim)
-#         # time(mean) + t_tilde_proj -> t_tilde_start
-#         self.net_t_tilde_start = nn.Sequential(
-#             nn.Linear(c_t + hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, 3),
-#         )
-#         # time(mean) + R_tilde_proj -> R_tilde_star(6D) -> rotmat
-#         self.net_R_tilde_star = nn.Sequential(
-#             nn.Linear(c_t + hidden_dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, 6),
-#         )
-        
-#         # Feature transformation before computing mean (φ in the paper)
-#         self.mlp_h_mean_ROT = nn.Sequential(
-#             nn.Linear(self.feat_dim, self.feat_dim),
-#             nn.ReLU(),
-#         )
-        
-#         # Key projection: transforms features to keys for attention
-#         self.att_mlp_key_ROT = nn.Linear(self.feat_dim, self.num_keypoints * self.feat_dim, bias=False)
-        
-#         # Query projection: transforms mean features to queries for attention
-#         self.att_mlp_query_ROT = nn.Linear(self.feat_dim, self.num_keypoints * self.feat_dim, bias=False)
 
-#     def _masked_mean(self, x, mask):
-#         """Masked mean over sequence dimension."""
-#         if mask is None:
-#             return x.mean(dim=1)
-#         mask = mask.float().unsqueeze(-1)
-#         denom = mask.sum(dim=1).clamp_min(1e-6)
-#         return (x * mask).sum(dim=1) / denom
+class EdgeTransition(nn.Module):
+    """
+    Updates edge (pair) representation from node embeddings. Same interface as
+    PepFlowww.models_con.ipa_pytorch.EdgeTransition; used in StackedIPABlocks.
+    """
 
-#     def _rot6d_to_rotmat(self, rot_6d):
-#         """Convert 6D rotation representation to rotation matrix."""
-#         # rot_6d: (B, 6)
-#         a1 = rot_6d[:, 0:3]
-#         a2 = rot_6d[:, 3:6]
+    def __init__(
+        self,
+        *,
+        node_embed_size: int,
+        edge_embed_in: int,
+        edge_embed_out: int,
+        num_layers: int = 2,
+        node_dilation: int = 2,
+    ):
+        super().__init__()
+        bias_embed_size = node_embed_size // node_dilation
+        self.initial_embed = Linear(node_embed_size, bias_embed_size, init="relu")
+        hidden_size = bias_embed_size * 2 + edge_embed_in
+        trunk_layers = []
+        for _ in range(num_layers):
+            trunk_layers.append(Linear(hidden_size, hidden_size, init="relu"))
+            trunk_layers.append(nn.ReLU())
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
+        self.layer_norm = nn.LayerNorm(edge_embed_out)
 
-#         b1 = F.normalize(a1, dim=-1)
-#         # Remove b1 component from a2, then normalize (Gram-Schmidt).
-#         proj = (b1 * a2).sum(dim=-1, keepdim=True) * b1
-#         b2 = F.normalize(a2 - proj, dim=-1)
-#         b3 = torch.cross(b1, b2, dim=-1)
+    def forward(self, node_embed: torch.Tensor, edge_embed: torch.Tensor) -> torch.Tensor:
+        node_embed = self.initial_embed(node_embed)
+        batch_size, num_res, _ = node_embed.shape
+        edge_bias = torch.cat([
+            node_embed.unsqueeze(2).expand(-1, -1, num_res, -1),
+            node_embed.unsqueeze(1).expand(-1, num_res, -1, -1),
+        ], dim=-1)
+        edge_embed = torch.cat([edge_embed, edge_bias], dim=-1).reshape(
+            batch_size * num_res * num_res, -1
+        )
+        edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
+        edge_embed = self.layer_norm(edge_embed)
+        edge_embed = edge_embed.reshape(batch_size, num_res, num_res, -1)
+        return edge_embed
 
-#         # Assemble columns to get (B, 3, 3).
-#         return torch.stack([b1, b2, b3], dim=-1)
 
-#     def _generate_keypoints(self, feats1, coors1, feats2, coors2, mask1=None, mask2=None):
-#         """
-#         Generate K keypoints for each protein using cross-attention.
-#         Similar to interface_model.py _generate_keypoints method.
-        
-#         Args:
-#             feats1: (B, N1, d) - features for protein 1
-#             coors1: (B, N1, 3) - coordinates for protein 1
-#             feats2: (B, N2, d) - features for protein 2
-#             coors2: (B, N2, 3) - coordinates for protein 2
-#             mask1: (B, N1) - mask for protein 1 (optional)
-#             mask2: (B, N2) - mask for protein 2 (optional)
-        
-#         Returns:
-#             Y1: (B, K, 3) - keypoints for protein 1
-#             Y2: (B, K, 3) - keypoints for protein 2
-#             attn1: (B, K, N1) - attention weights for protein 1
-#             attn2: (B, K, N2) - attention weights for protein 2
-#         """
-#         B, N1, d = feats1.shape
-#         B, N2, d = feats2.shape
-#         K = self.num_keypoints
-        
-#         # Compute mean features μ(φ(H₁)) and μ(φ(H₂))
-#         # Apply transformation φ first
-#         feats1_transformed = self.mlp_h_mean_ROT(feats1)  # (B, N1, d)
-#         feats2_transformed = self.mlp_h_mean_ROT(feats2)  # (B, N2, d)
-        
-#         # Compute mean
-#         if mask1 is not None:
-#             mask1_expanded = mask1.unsqueeze(-1)  # (B, N1, 1)
-#             feats1_masked = feats1_transformed * mask1_expanded
-#             H1_mean = feats1_masked.sum(dim=1, keepdim=True) / (mask1.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-#         else:
-#             H1_mean = feats1_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-#         if mask2 is not None:
-#             mask2_expanded = mask2.unsqueeze(-1)  # (B, N2, 1)
-#             feats2_masked = feats2_transformed * mask2_expanded
-#             H2_mean = feats2_masked.sum(dim=1, keepdim=True) / (mask2.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6)  # (B, 1, d)
-#         else:
-#             H2_mean = feats2_transformed.mean(dim=1, keepdim=True)  # (B, 1, d)
-        
-#         # Generate Y2 (keypoints for protein 2)
-#         # Query: μ(φ(H₁)) (mean of protein 1 features)
-#         # Keys: h₂ⱼ (each feature from protein 2)
-#         # Formula: βⱼᵏ = softmaxⱼ (¹/√ᵈ h₂ⱼᵀ W μ(φ(H₁)))
-#         keys_2 = self.att_mlp_key_ROT(feats2)  # (B, N2, K*d)
-#         keys_2 = keys_2.view(B, N2, K, d)  # (B, N2, K, d)
-#         keys_2 = keys_2.transpose(1, 2)  # (B, K, N2, d)
-        
-#         query_2 = self.att_mlp_query_ROT(H1_mean)  # (B, 1, K*d)
-#         query_2 = query_2.view(B, 1, K, d)  # (B, 1, K, d)
-#         query_2 = query_2.transpose(1, 2)  # (B, K, 1, d)
-#         query_2 = query_2.transpose(2, 3)  # (B, K, d, 1)
-        
-#         # Attention scores: (B, K, N2, 1)
-#         att_scores_2 = (keys_2 @ query_2) / math.sqrt(d)  # (B, K, N2, 1)
-        
-#         # Apply mask if provided
-#         if mask2 is not None:
-#             mask2_expanded = mask2.unsqueeze(1).unsqueeze(-1)  # (B, 1, N2, 1)
-#             mask2_expanded = mask2_expanded.expand(-1, K, -1, -1)  # (B, K, N2, 1)
-#             att_scores_2 = att_scores_2.masked_fill(~mask2_expanded.bool(), -1e9)
-        
-#         attn2 = F.softmax(att_scores_2.squeeze(-1), dim=-1)  # (B, K, N2)
-        
-#         # Compute Y2: weighted sum of coordinates
-#         # y₂ₖ := Σⱼ₌₁ᵐ βⱼᵏ z₂ⱼ
-#         Y2 = einsum(attn2, coors2, 'b k n2, b n2 d -> b k d')  # (B, K, 3)
-        
-#         # Generate Y1 (keypoints for protein 1)
-#         # Query: μ(φ(H₂)) (mean of protein 2 features)
-#         # Keys: h₁ᵢ (each feature from protein 1)
-#         # Formula: αᵢᵏ = softmaxᵢ (¹/√ᵈ h₁ᵢᵀ W μ(φ(H₂)))
-#         keys_1 = self.att_mlp_key_ROT(feats1)  # (B, N1, K*d)
-#         keys_1 = keys_1.view(B, N1, K, d)  # (B, N1, K, d)
-#         keys_1 = keys_1.transpose(1, 2)  # (B, K, N1, d)
-        
-#         query_1 = self.att_mlp_query_ROT(H2_mean)  # (B, 1, K*d)
-#         query_1 = query_1.view(B, 1, K, d)  # (B, 1, K, d)
-#         query_1 = query_1.transpose(1, 2)  # (B, K, 1, d)
-#         query_1 = query_1.transpose(2, 3)  # (B, K, d, 1)
-        
-#         # Attention scores: (B, K, N1, 1)
-#         att_scores_1 = (keys_1 @ query_1) / math.sqrt(d)  # (B, K, N1, 1)
-        
-#         # Apply mask if provided
-#         if mask1 is not None:
-#             mask1_expanded = mask1.unsqueeze(1).unsqueeze(-1)  # (B, 1, N1, 1)
-#             mask1_expanded = mask1_expanded.expand(-1, K, -1, -1)  # (B, K, N1, 1)
-#             att_scores_1 = att_scores_1.masked_fill(~mask1_expanded.bool(), -1e9)
-        
-#         attn1 = F.softmax(att_scores_1.squeeze(-1), dim=-1)  # (B, K, N1)
-        
-#         # Compute Y1: weighted sum of coordinates
-#         # y₁ₖ := Σᵢ₌₁ⁿ αᵢᵏ z₁ᵢ
-#         Y1 = einsum(attn1, coors1, 'b k n1, b n1 d -> b k d')  # (B, K, 3)
-        
-#         return Y1, Y2, attn1, attn2
+class StackedIPABlocks(nn.Module):
+    """
+    GA-style stacked IPA blocks operating on single representations + rigids.
 
-#     def forward(self, Y1, Y2, s1, p1_coords, s2, p2_coords, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2):
-#         """
-#         Args:
-#             s1: (B, N1, c_s) - protein 1 features
-#             s2: (B, N2, c_s) - protein 2 features
-#             p1_coords: (B, N1, 3) - protein 1 coordinates
-#             p2_coords: (B, N2, 3) - protein 2 coordinates (moved)
-#             R_star: (B, 3, 3) - initial rotation matrix from Kabsch
-#             t_star: (B, 3) - initial translation vector from Kabsch
-#             R_tilde: (B, 3, 3) - noised rotation matrix at timestep t
-#             t_tilde: (B, 3) - noised translation vector at timestep t
-#             t_emb: (B, c_t) or (B, 1, c_t) - time embedding
-#             p1_mask: (B, N1) - mask for protein 1 residues
-#             p2_mask: (B, N2) - mask for protein 2 residues
-#             sigma_1: (B, 3, 3) - optional interface representation for protein 1
-#             sigma_2: (B, 3, 3) - optional interface representation for protein 2
-        
-#         Returns:
-#             R_pred: (B, 3, 3) - predicted rotation matrix R̂₁
-#             t_pred: (B, 3) - predicted translation vector t̂₁
-#         """
-#         B = s1.shape[0]
-#         t_curr = t_star
-#         R_curr = R_star
+    Per block:
+        node_embed -> IPA -> LN(residual)
+                    -> Transformer over nodes -> Linear back to c_s
+                    -> node transition MLP
+                    -> backbone rigid update (compose_q_update_vec)
+    """
 
-#         # t_emb: mean over seq -> (B, c_t); t_tilde/R_tilde: project to hidden_dim -> (B, hidden_dim); then cat
-#         t_emb_flat = t_emb.mean(dim=1) if t_emb.dim() == 3 else t_emb  # (B, c_t)
-#         t_tilde_flat = t_tilde.reshape(B, -1)[:, :3]  # (B, 3), any input shape
-#         R_tilde_flat = R_tilde.reshape(B, 3, 3)
-#         R_tilde_6d = R_tilde_flat[:, :, :2].reshape(B, 6)
-#         t_tilde_proj = self.proj_t_tilde(t_tilde_flat)   # (B, hidden_dim)
-#         R_tilde_proj = self.proj_R_tilde(R_tilde_6d)     # (B, hidden_dim)
-#         t_tilde_start = self.net_t_tilde_start(torch.cat([t_emb_flat, t_tilde_proj], dim=-1))  # (B, 3)
-#         R_tilde_star_6d = self.net_R_tilde_star(torch.cat([t_emb_flat, R_tilde_proj], dim=-1))
-#         R_tilde_star = self._rot6d_to_rotmat(R_tilde_star_6d)  # (B, 3, 3)
-        
-#         # Build cross-attention context from projected s1/s2 features.
-#         s1_proj = self.proj_s1(s1)  # (B, N1, hidden_dim)
-#         s2_proj = self.proj_s2(s2)  # (B, N2, hidden_dim)
-#         p1_pad_mask = ~p1_mask.bool() if p1_mask is not None else None
-#         p2_pad_mask = ~p2_mask.bool() if p2_mask is not None else None
+    def __init__(self, ipa_conf, num_blocks: int):
+        super().__init__()
+        self._ipa_conf = ipa_conf
+        self.num_blocks = num_blocks
 
-#         s1_cross, _ = self.cross_attn_rt(
-#             query=s1_proj, key=s2_proj, value=s2_proj, key_padding_mask=p2_pad_mask
-#         )  # (B, N1, hidden_dim)
-#         s2_cross, _ = self.cross_attn_rt(
-#             query=s2_proj, key=s1_proj, value=s1_proj, key_padding_mask=p1_pad_mask
-#         )  # (B, N2, hidden_dim)
+        self.trunk = nn.ModuleDict()
 
-#         s1_ctx = self._masked_mean(s1_cross, p1_mask)  # (B, hidden_dim)
-#         s2_ctx = self._masked_mean(s2_cross, p2_mask)  # (B, hidden_dim)
-#         p2_coords_curr = p2_coords
+        # Defaults if not present in ipa_conf
+        n_heads = getattr(self._ipa_conf, "seq_tfmr_num_heads", 4)
+        n_layers = getattr(self._ipa_conf, "seq_tfmr_num_layers", 1)
 
-#         for _ in range(self.num_refine_steps):
-#             # Predict attention weights over virtual keypoints from cross-attention context.
-#             y1_logits = self.y1_weight_head(s1_ctx)  # (B, K)
-#             y2_logits = self.y2_weight_head(s2_ctx)  # (B, K)
-#             y1_weights = F.softmax(y1_logits, dim=-1)
-#             y2_weights = F.softmax(y2_logits, dim=-1)
-#             y1_weighted = torch.einsum('bk,bkd->bd', y1_weights, Y1)  # (B, 3)
-#             y2_weighted = torch.einsum('bk,bkd->bd', y2_weights, Y2)  # (B, 3)
+        for b in range(self.num_blocks):
+            # IPA + layer norm
+            self.trunk[f"ipa_{b}"] = InvariantPointAttention(self._ipa_conf)
+            self.trunk[f"ipa_ln_{b}"] = nn.LayerNorm(self._ipa_conf.c_s)
 
-#             rt_input = y1_weighted + y2_weighted  # (B, 3)
-#             h_rt = self.rt_trunk(rt_input)
-#             rot_6d = self.rot_head(h_rt)
-#             delta_t = self.trans_head(h_rt)
+            # Transformer over node features
+            tfmr_in = self._ipa_conf.c_s
+            tfmr_layer = torch.nn.TransformerEncoderLayer(
+                d_model=tfmr_in,
+                nhead=n_heads,
+                dim_feedforward=tfmr_in,
+                batch_first=True,
+                dropout=0.0,
+                norm_first=False,
+            )
+            self.trunk[f"seq_tfmr_{b}"] = torch.nn.TransformerEncoder(
+                tfmr_layer,
+                n_layers,
+                enable_nested_tensor=False,
+            )
+            self.trunk[f"post_tfmr_{b}"] = Linear(
+                tfmr_in, self._ipa_conf.c_s, init="final"
+            )
 
-#             R_delta = self._rot6d_to_rotmat(rot_6d)
-#             R_curr = R_delta @ R_curr @ R_tilde_star.transpose(1, 2)
-#             # Keep (R, t) composition consistent with x' = x @ R^T + t.
-#             t_curr = (t_curr.unsqueeze(1) @ R_delta.transpose(1, 2)).squeeze(1) + delta_t + t_tilde_start
+            # Node transition
+            self.trunk[f"node_transition_{b}"] = nn.Sequential(
+                nn.Linear(self._ipa_conf.c_s, self._ipa_conf.c_s),
+                nn.ReLU(),
+                nn.Linear(self._ipa_conf.c_s, self._ipa_conf.c_s),
+            )
 
-#             # Alternate update: move protein-2 coordinates and regenerate virtual interface nodes.
-#             p2_coords_curr = p2_coords_curr @ R_delta.transpose(1, 2) + delta_t.unsqueeze(1)
-#             Y1, Y2, _, _ = self._generate_keypoints(
-#                 s1, p1_coords,
-#                 s2, p2_coords_curr,
-#                 p1_mask, p2_mask
-#             )
+            # Backbone update
+            self.trunk[f"bb_update_{b}"] = BackboneUpdateLocal(self._ipa_conf.c_s)
 
-#         return R_curr, t_curr
+            # Edge transition (no edge update on the last block, same as ga.py)
+            if b < self.num_blocks - 1:
+                self.trunk[f"edge_transition_{b}"] = EdgeTransition(
+                    node_embed_size=self._ipa_conf.c_s,
+                    edge_embed_in=self._ipa_conf.c_z,
+                    edge_embed_out=self._ipa_conf.c_z,
+                )
+
+    def forward(
+        self,
+        node_embed: torch.Tensor,
+        edge_embed: torch.Tensor,
+        rigids: Rigid,
+        node_mask: torch.Tensor,
+    ):
+        """
+        Args:
+            node_embed: (B, N, c_s)
+            edge_embed: (B, N, N, c_z) or None (only passed to IPA)
+            rigids:     Rigid object with batch & residue dims matching node_embed
+            node_mask:  (B, N) 0/1 mask
+        Returns:
+            node_embed: updated single representations
+            edge_embed: updated pair representations (same as input if num_blocks==1)
+            rigids:     updated rigids after all blocks
+        """
+        node_mask = node_mask.float()
+        edge_mask = node_mask[:, None] * node_mask[:, :, None]
+        curr_rigids = rigids
+
+        for b in range(self.num_blocks):
+            ipa_out = self.trunk[f"ipa_{b}"](
+                s=node_embed,
+                z=edge_embed,
+                r=curr_rigids,
+                mask=node_mask,
+                i_repr=None,
+            )
+            ipa_out = ipa_out * node_mask.unsqueeze(-1)
+            node_embed = self.trunk[f"ipa_ln_{b}"](node_embed + ipa_out)
+
+            # Transformer over nodes
+            seq_tfmr_out = self.trunk[f"seq_tfmr_{b}"](
+                node_embed, src_key_padding_mask=(1 - node_mask).bool()
+            )
+            node_embed = node_embed + self.trunk[f"post_tfmr_{b}"](seq_tfmr_out)
+
+            # Node transition
+            node_embed = self.trunk[f"node_transition_{b}"](node_embed)
+            node_embed = node_embed * node_mask.unsqueeze(-1)
+
+            # Backbone update via compose_q_update_vec
+            rigid_update = self.trunk[f"bb_update_{b}"](
+                node_embed * node_mask.unsqueeze(-1)
+            )
+            curr_rigids = curr_rigids.compose_q_update_vec(
+                rigid_update, node_mask.unsqueeze(-1)
+            )
+
+            # Edge transition (no edge update on the last block, same as ga.py)
+            if b < self.num_blocks - 1:
+                edge_embed = self.trunk[f"edge_transition_{b}"](node_embed, edge_embed)
+                edge_embed = edge_embed * edge_mask.unsqueeze(-1)
+
+        return node_embed, edge_embed, curr_rigids
+
 
 class TernaryDenoiseBlock(nn.Module):
     def __init__(self, ipa_conf, num_classes=25):
@@ -2126,41 +1607,17 @@ class TernaryDenoiseBlock(nn.Module):
 
         # Ternary Denoise Block components according to Algorithm 2
         
-        # Shared IPA module for feature processing
-        self.ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
-        self.ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
+        # NOTE: original single-step IPA blocks (kept for reference)
+        # # Shared IPA module for feature processing
+        # self.ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
+        # self.ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
+        #
+        # self.lig_ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
+        # self.lig_ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
 
-        self.lig_ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
-        self.lig_ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
-
-        # Cross attention block to update the coordinate of the molecular glue.
-        # self.phi_X = PhiX(
-        #     c_s=self._ipa_conf.c_s,
-        #     c_t=self._ipa_conf.c_s,
-        #     hidden_dim=self._ipa_conf.c_s
-        # )
-        
-        # Cross attention block to update the sequence of the molecular glue.
-        # self.phi_A = PhiA(
-        #     c_s=self._ipa_conf.c_s,
-        #     c_t=self._ipa_conf.c_s,
-        #     hidden_dim=self._ipa_conf.c_s,
-        #     num_classes=num_classes
-        # )
-        
-        # Rotation prediction module
-        # self.phi_R = PhiR(
-        #     c_s=self._ipa_conf.c_s,
-        #     c_t=self._ipa_conf.c_s,
-        #     hidden_dim=self._ipa_conf.c_s
-        # )
-        
-        # Translation prediction module
-        # self.phi_T = PhiT(
-        #     c_s=self._ipa_conf.c_s,
-        #     c_t=self._ipa_conf.c_s,
-        #     hidden_dim=self._ipa_conf.c_s
-        # )
+        # Shared stacked IPA module for feature & rigid processing (GA-style blocks)
+        num_stacked = getattr(self._ipa_conf, "num_blocks", 2)
+        self.stacked_ipa = StackedIPABlocks(self._ipa_conf, num_blocks=num_stacked)
 
         self.phix = Phix(
             c_s=self._ipa_conf.c_s,
@@ -2212,17 +1669,23 @@ class TernaryDenoiseBlock(nn.Module):
         p1_mask = p1['res_mask']
         p2_mask = p2['res_mask']
         p1_coords = p1['pos_heavyatom'][:, :, BBHeavyAtom.CA]
-        p2_coords = p2['pos_heavyatom'][:, :, BBHeavyAtom.CA]
+        # p2_coords = p2['pos_heavyatom'][:, :, BBHeavyAtom.CA]
 
-        # Obtain the single representation of the two proteins and the molecular glue with IPA block.
-        s1_tilde = self.ipa(s=s1, z=z1, r=T1, mask=p1_mask, i_repr=None) # (B, N1, c_s)
-        s1_tilde = self.ipa_ln(s1_tilde)
-        
-        s2_tilde = self.ipa(s=s2, z=z2, r=T2, mask=p2_mask, i_repr=None) # (B, N2, c_s)
-        s2_tilde = self.ipa_ln(s2_tilde)
+        # NOTE: original single-step IPA usage (kept for reference)
+        # # Obtain the single representation of the two proteins and the molecular glue with IPA block.
+        # s1_tilde = self.ipa(s=s1, z=z1, r=T1, mask=p1_mask, i_repr=None) # (B, N1, c_s)
+        # s1_tilde = self.ipa_ln(s1_tilde)
+        #
+        # s2_tilde = self.ipa(s=s2, z=z2, r=T2, mask=p2_mask, i_repr=None) # (B, N2, c_s)
+        # s2_tilde = self.ipa_ln(s2_tilde)
+        #
+        # s_l_tilde = self.lig_ipa(s=s_l, z=z_l, r=Tl, mask=mol_mask, i_repr=None) # (B, N_l, c_s)
+        # s_l_tilde = self.lig_ipa_ln(s_l_tilde)
 
-        s_l_tilde = self.lig_ipa(s=s_l, z=z_l, r=Tl, mask=mol_mask, i_repr=None) # (B, N_l, c_s)
-        s_l_tilde = self.lig_ipa_ln(s_l_tilde)
+        # Obtain updated single representations (and optionally pair/rigids) with stacked IPA blocks.
+        s1_tilde, _, _ = self.stacked_ipa(node_embed=s1, edge_embed=z1, rigids=T1, node_mask=p1_mask)
+        s2_tilde, _, _ = self.stacked_ipa(node_embed=s2, edge_embed=z2, rigids=T2, node_mask=p2_mask)
+        s_l_tilde, _, _ = self.stacked_ipa(node_embed=s_l, edge_embed=z_l, rigids=Tl, node_mask=mol_mask)
         
         # Compute pairwise coordinate differences between molecular glue atoms
         B, N, _ = X_tilde.shape
@@ -2244,49 +1707,22 @@ class TernaryDenoiseBlock(nn.Module):
         # Time embedding
         t_emb = self.embed_t(t, mol_mask)  # [B, N, c_t]
 
-        # Compute updated coordinates via PhiX (with multi-layer coordinate updates)
-        # Formula: X_i^pred = X_i^t + sum_{j≠i} (X_i^t - X_j^t) * φ_X(h_i, h_j, ||X_i^t - X_j^t||², t)
-        # PhiX now performs multi-layer updates internally and returns the final coordinates
-        # X_pred = self.phi_X(s1_tilde, p1_coords, i1_mask, s2_tilde, p2_coords, i2_mask, s_l_tilde, X_tilde, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, 3]
+        #########################################################
+        # Molecular glue sequence and coordinate prediction.
+        #########################################################
 
         #########################################################
-        # Molecular glue sequence prediction.
+        # Translation vector and rotation matrix prediction to move the protein 2 to the final ternary complex.
         #########################################################
-        # Sequence prediction using PhiA: a_i^pred = φ_A(s̃^(1), s̃^(2), ã_i^t, t)
+        R_pred, t_pred = self.phiRT(Y1, Y2, s1_tilde, p1_coords, s2_tilde, p2_coords_moved, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2)
         
+        p2_coords_moved = p2_coords_moved @ R_pred.transpose(1, 2) + t_pred.unsqueeze(1) # Refine the coordinates of protein 2 to the final ternary complex.     
+        
+        # Compute updated coordinates via PhiX (with multi-layer coordinate updates)
         # Get probability distributions from PhiA for each atom
-        # phi_a_probs = self.phi_A(s1_tilde, s2_tilde, s_l_tilde, t_emb, p1_mask, p2_mask, mol_mask)  # [B, N, num_classes]
-        
         X_pred, phi_a_probs = self.phix(s1_tilde, p1_coords, s2_tilde, p2_coords_moved, s_l_tilde, X_tilde, t_emb, p1_mask, p2_mask, mol_mask)
         # Apply final mask
         seq_pred = phi_a_probs * mol_mask.unsqueeze(-1)
-
-        #########################################################
-        # Translation vector prediction to move the protein 2 to the final ternary complex.
-        #########################################################
-        # Formula: t^pred = t~^t + Σ_{i ∈ I_2} Σ_j (X~_i - X~_j^pred) φ_t(s~_i, h~_j, ||X~_i - X~_j^pred||_2^2, t)
-        # Use X_pred (predicted ligand coordinates) for X~_j^pred in the formula
-        # t_pred = self.phi_T(s2_tilde, p2_coords, i2_mask, X_pred, seq_tilde, t_emb, t_tilde, p2_mask, mol_mask)
-        # t_pred = self.phi_T(s2_tilde, p2_coords, i2_mask, X_tilde, seq_tilde, t_emb, t_tilde, p2_mask, mol_mask)
-        # X_tilde or X_pred?
-        # t_pred, p1_mu, p2_mu = self.phi_T(s1_tilde, s2_tilde, p1_coords, p2_coords_moved, X_tilde, seq_tilde, t_tilde, 
-        #                     p1_mask, p2_mask, mol_mask, t_emb)
-        # t_pred = self.phi_T(s1_tilde, s2_tilde, p1_coords, p2_coords_moved, X_tilde, s_l_tilde, t_tilde, 
-        #                     p1_mask, p2_mask, mol_mask, t_emb)
-
-        
-        # Apply the rotation to the translation residual: t_pred = t_tilde + R_pred * Δt
-        # t_pred = t_tilde + torch.matmul(R_pred, delta_t.unsqueeze(-1)).squeeze(-1)  # [B, 3]
-
-        #########################################################
-        # Rotation matrix prediction to move the protein 2 to the final ternary complex.
-        #########################################################
-        # R_pred = self.phi_R(s1_tilde, s2_tilde, R_tilde, t_emb,
-        #                     p1_coords, p2_coords,
-        #                     p1_mask, p2_mask, mol_mask, p1_mu, p2_mu)
-        # R_pred = self.phi_R(s1_tilde, s2_tilde, s_l_tilde, R_tilde, t_emb, p1_mask, p2_mask, mol_mask, sigma_1, sigma_2)
-        
-        R_pred, t_pred = self.phiRT(Y1, Y2, s1_tilde, p1_coords, s2_tilde, p2_coords_moved, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2)
 
         return X_pred, seq_pred, R_pred, t_pred
 
@@ -2390,25 +1826,7 @@ class VFModel(nn.Module):
         return s1, s2, s_l, z1, z2, z_l, T1, T2, Tl
         
 
-    def forward(self, 
-                p1, 
-                p2, 
-                t, 
-                lig_coords_t, 
-                rotmats_t, 
-                trans_t, 
-                lig_seq_t, 
-                mol_mask, 
-                # i1_mask, 
-                # i2_mask,
-                p2_coords_moved,
-                sigma_1,
-                sigma_2,
-                R_star,
-                t_star,
-                Y1,
-                Y2
-        ):
+    def forward(self, p1, p2, t, lig_coords_t, rotmats_t, trans_t, lig_seq_t, mol_mask, p2_coords_moved, sigma_1, sigma_2, R_star, t_star, Y1, Y2):
         """
         Forward pass using TernaryDenoiseBlock
         
