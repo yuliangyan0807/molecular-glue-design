@@ -1,6 +1,10 @@
 import torch
 import enum
 
+# translation normalization
+TRANS_MEAN = torch.tensor([1.6158, -4.3522, -2.6975])
+TRANS_STD = torch.tensor([34.6077, 38.5431, 30.9749])
+
 # ligand atom features
 # only atomic number 1, 6, 7, 8, 9, 15, 16, 17 exist
 ATOM_FAMILIES = ['Acceptor', 'Donor', 'Aromatic', 'Hydrophobe', 'LumpedHydrophobe', 'NegIonizable', 'PosIonizable',

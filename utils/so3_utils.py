@@ -481,6 +481,31 @@ def geodesic_dist(mat_1: torch.Tensor, mat_2: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(multidim_trace(rot_mult(A, rot_transpose(A))))
 
 
+def project_to_so3(mat: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable projection of 3x3 matrices onto SO(3) (nearest rotation matrix).
+    Uses SVD: R = U @ Vh, then corrects for reflection so det(R) = 1.
+
+    Args:
+        mat (torch.Tensor): Batch of 3x3 matrices, shape (..., 3, 3).
+
+    Returns:
+        torch.Tensor: Nearest rotation matrix in SO(3), same shape as mat.
+    """
+    U, S, Vh = torch.linalg.svd(mat)
+    # R = U @ Vh (for real matrices Vh is V^T)
+    R = torch.einsum("...ij,...jk->...ik", U, Vh)
+    # Ensure proper rotation (det = 1): if det(R) = -1, flip last column of R (out-of-place to avoid autograd error)
+    det_R = torch.linalg.det(R)
+    sign = torch.sign(det_R)
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    col0 = R[..., :, 0:1]
+    col1 = R[..., :, 1:2]
+    col2 = R[..., :, 2:3] * sign.unsqueeze(-1).unsqueeze(-1)
+    R_corrected = torch.cat([col0, col1, col2], dim=-1)
+    return R_corrected
+
+
 def rot_transpose(mat: torch.Tensor) -> torch.Tensor:
     """Take the transpose of the last two dimensions."""
     return torch.transpose(mat, -1, -2)

@@ -1,6 +1,0 @@
-torch>=1.9.0
-einops>=0.3.0
-datasets>=2.0.0
-numpy>=1.21.0
-wandb>=0.15.0
-pyarrow>=10.0.0 

@@ -400,7 +400,7 @@ def main():
                        help='Path to dataset directory')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
-    parser.add_argument('--val_split', type=float, default=0.05, help='Validation split ratio (default: 0.05)')
+    parser.add_argument('--val_split', type=float, default=0.0, help='Validation split ratio (default: 0.05)')
     
     # Model arguments
     parser.add_argument('--model_dim', type=int, default=128, help='Model dimension')
