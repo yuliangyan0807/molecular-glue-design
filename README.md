@@ -23,8 +23,23 @@ GPU recommended for train/eval. Multi-GPU via `torchrun`.
 | Interface encoder (train init) | `checkpoints/interface-model/latest.pt` | Frozen during flow training; also referenced in config |
 | SeFMol refine (optional) | `SeFMol/ckpt/checkpoint/sefmol.pt` | Used by `sample.sh` / `run_eval_ligand.sh` |
 
+Weights are **not** shipped in this repository. Download them and place files at the paths above:
+
+- Flow + interface checkpoints: *[TODO: add download link]*
+- SeFMol checkpoint (`sefmol.pt`): *[TODO: add download link]*
+
+```bash
+mkdir -p SeFMol/ckpt/checkpoint checkpoints_0407 checkpoints/interface-model
+# after download:
+# mv /path/to/sefmol.pt SeFMol/ckpt/checkpoint/sefmol.pt
+# mv /path/to/latest.pt checkpoints_0407/latest.pt
+# mv /path/to/interface_latest.pt checkpoints/interface-model/latest.pt
+```
+
 Config: `configs/flow_matching_config.yaml`  
 (`model.interface_model.path` → `./checkpoints/interface-model/latest.pt`, `trainable: false`)
+
+SeFMol source lives under `SeFMol/` (code only; see `SeFMol/README.md` for the upstream project).
 
 ## Data layout
 

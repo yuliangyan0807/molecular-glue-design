@@ -5,4 +5,19 @@ logs/
 pocket_results/
 wandb/
 checkpoints/
+checkpoints_*/
 openfold/
+build/
+openbabel-openbabel-2-4-0/
+
+# Model weights (provide separately via download link)
+*.pt
+*.pth
+*.ckpt
+*.tar.gz
+**/__pycache__/
+*.pyc
+
+# Nested git metadata if SeFMol was cloned as its own repo
+SeFMol/.git/
+SeFMol/.git.bak_nested/
