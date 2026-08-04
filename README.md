@@ -2,6 +2,8 @@
 
 Ternary complex generation with a flow-matching model (protein–protein docking + ligand atom types/coords), optional SeFMol ligand refinement, and DockQ / Vina evaluation.
 
+**Code:** https://github.com/yuliangyan0807/molecular-glue-design
+
 ## Environment
 
 Python 3.10, CUDA 12.4. GPU recommended for train/eval. Multi-GPU via `torchrun`.
