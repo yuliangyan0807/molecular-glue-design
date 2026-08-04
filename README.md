@@ -4,15 +4,38 @@ Ternary complex generation with a flow-matching model (protein–protein docking
 
 ## Environment
 
-Recommended: conda env `mgd`.
+Python 3.10, CUDA 12.4. GPU recommended for train/eval. Multi-GPU via `torchrun`.
 
-```bash
-conda activate mgd
-# Key packages used in our runs (approx.):
-# torch 2.12 + CUDA, rdkit, datasets, biopandas, biopython, scipy, wandb, pyyaml, tqdm
 ```
-
-GPU recommended for train/eval. Multi-GPU via `torchrun`.
+torch==2.6.0
+torch-geometric==2.6.1
+torch_scatter==2.1.2+pt26cu124
+torch_sparse==0.6.18+pt26cu124
+torch_cluster==1.6.3+pt26cu124
+lightning==2.6.1
+pytorch-lightning==2.6.0
+rdkit==2023.9.3
+numpy==1.24.0
+scipy==1.15.3
+pandas==1.5.2
+biopython==1.83
+biopandas==0.5.1
+datasets==4.8.4
+einops==0.8.2
+e3nn==0.6.0
+easydict==1.9
+lmdb==1.7.5
+networkx==3.4.2
+openbabel-wheel==3.1.1.11
+PyYAML==6.0.3
+tqdm==4.67.3
+scikit-learn==1.7.2
+vina==1.2.7
+meeko==0.1.dev3
+pillow==12.2.0
+pymol-open-source==3.2.0a0
+huggingface_hub==1.10.1
+```
 
 ## Checkpoints
 
@@ -23,17 +46,33 @@ GPU recommended for train/eval. Multi-GPU via `torchrun`.
 | Interface encoder (train init) | `checkpoints/interface-model/latest.pt` | Frozen during flow training; also referenced in config |
 | SeFMol refine (optional) | `SeFMol/ckpt/checkpoint/sefmol.pt` | Used by `sample.sh` / `run_eval_ligand.sh` |
 
-Weights are **not** shipped in this repository. Download them and place files at the paths above:
+Weights and datasets are **not** shipped in this repository. Download from Google Drive:
 
-- Flow + interface checkpoints: *[TODO: add download link]*
-- SeFMol checkpoint (`sefmol.pt`): *[TODO: add download link]*
+https://drive.google.com/drive/folders/1L0Yxdl5cAOQAxO1cbaHtflLueYH9pcRu
+
+| Drive file | Local path after download / extract |
+|------------|-------------------------------------|
+| `flow_latest.pt` | `checkpoints_0407/latest.pt` |
+| `flow_best.pt` | `checkpoints_0407/best.pt` |
+| `interface_latest.pt` | `checkpoints/interface-model/latest.pt` |
+| `sefmol.pt` | `SeFMol/ckpt/checkpoint/sefmol.pt` |
+| `TernaryDataset_test.tar.gz` | `data/Moloctite/TernaryDataset_test/` |
+| `MGD_test.tar.gz` | `data/TernaryDB/MGD_test/` |
+| `TernaryDataset_filtered.tar.gz` | `data/Moloctite/TernaryDataset_filtered/` |
+| `interface_modeling_dataset_1208.tar.gz` | `data/Moloctite/interface_modeling_dataset_1208/` |
 
 ```bash
-mkdir -p SeFMol/ckpt/checkpoint checkpoints_0407 checkpoints/interface-model
-# after download:
-# mv /path/to/sefmol.pt SeFMol/ckpt/checkpoint/sefmol.pt
-# mv /path/to/latest.pt checkpoints_0407/latest.pt
-# mv /path/to/interface_latest.pt checkpoints/interface-model/latest.pt
+mkdir -p SeFMol/ckpt/checkpoint checkpoints_0407 checkpoints/interface-model data/Moloctite data/TernaryDB
+
+mv flow_latest.pt checkpoints_0407/latest.pt
+mv flow_best.pt checkpoints_0407/best.pt
+mv interface_latest.pt checkpoints/interface-model/latest.pt
+mv sefmol.pt SeFMol/ckpt/checkpoint/sefmol.pt
+
+tar -xzf TernaryDataset_test.tar.gz -C data/Moloctite
+tar -xzf MGD_test.tar.gz -C data/TernaryDB
+tar -xzf TernaryDataset_filtered.tar.gz -C data/Moloctite
+tar -xzf interface_modeling_dataset_1208.tar.gz -C data/Moloctite
 ```
 
 Config: `configs/flow_matching_config.yaml`  
@@ -85,8 +124,6 @@ For a paper-style run matching our eval, keep / download **`checkpoints_0407/lat
 
 ## 3. Evaluate (protein metrics: RMSD / DockQ / …)
 
-This is the main evaluation path used for `evaluation_results_0422`:
-
 ```bash
 bash run_evaluation.sh
 ```
@@ -99,21 +136,15 @@ Equivalent settings:
 - `num_trajectories_per_sample=100`, `trajectory_batch_size=2`, `seed=42`
 - Multi-GPU: `GPU_IDS=0,1,2,3,4,5,6,7`
 
-Outputs go to `evaluation_results_0422/` (`summary_metrics.json`, `detailed_results.json`, …).
-
-Quick / ablation-style eval (fewer trajs):
-
-```bash
-bash ablation_study.sh   # also uses checkpoints_0407/latest.pt, 20 trajs
-```
+Outputs go to `evaluation_results/` (`summary_metrics.json`, `detailed_results.json`, …).
 
 ## 4. Ligand evaluation (+ SeFMol refine, Vina)
 
 Depends on step 3’s `detailed_results.json`:
 
 ```bash
-DETAILED_JSON=evaluation_results_0422/detailed_results.json \
-OUTPUT_JSON=evaluation_results_0422/ligand_eval_results_0428.json \
+DETAILED_JSON=evaluation_results/detailed_results.json \
+OUTPUT_JSON=evaluation_results/ligand_eval_results.json \
 SEFMOL_REFINE=1 \
 SEFMOL_CKPT=SeFMol/ckpt/checkpoint/sefmol.pt \
 bash run_eval_ligand.sh
@@ -123,9 +154,9 @@ Optional merge of best DockQ + ligand metrics:
 
 ```bash
 python export_per_complex_best_metrics.py \
-  --detailed_json evaluation_results_0422/detailed_results.json \
-  --ligand_json evaluation_results_0422/ligand_eval_results_0428.json \
-  --output_json evaluation_results_0422/per_complex_best_metrics.json
+  --detailed_json evaluation_results/detailed_results.json \
+  --ligand_json evaluation_results/ligand_eval_results.json \
+  --output_json evaluation_results/per_complex_best_metrics.json
 ```
 
 ## 5. End-to-end sampling (flow + SeFMol)
@@ -149,10 +180,9 @@ SAMPLE_ALL=0 COMPLEX_NAME=5MN0_A_B_A8S DEVICE=cuda:0 bash sample.sh
 
 ## Reproduce our reported eval numbers
 
-1. Place weights at `checkpoints_0407/latest.pt` (and interface ckpt if re-training).
-2. Place test data under the paths above.
-3. `bash run_evaluation.sh` → protein/complex metrics.
-4. `bash run_eval_ligand.sh` → ligand / Vina (with SeFMol).
+1. Download weights and data from the Google Drive folder above and place/extract as listed.
+2. `bash run_evaluation.sh` → protein/complex metrics.
+3. `bash run_eval_ligand.sh` → ligand / Vina (with SeFMol).
 
 Do **not** swap in `best.pt` unless you intentionally want the val-RMSD checkpoint; current scripts and results use **`latest.pt` @ epoch 800**.
 

@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # Configuration
-NPROC=${NPROC:-1}
-DATASET_DIR=${DATASET_DIR:-"./interface_modeling_dataset_v2"}
+NPROC=${NPROC:-8}
+DATASET_DIR=${DATASET_DIR:-"./data/Moloctite/interface_modeling_dataset_1208"}
 LOG_DIR=${LOG_DIR:-"./logs"}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-"./checkpoints"}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-"./checkpoints_$(date +%Y%m%d-%H%M%S)"}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-5e-4}
-EPOCHS=${EPOCHS:-700}
+EPOCHS=${EPOCHS:-1200}
 PROJECT=${PROJECT:-"interface_model"}
-NAME=${NAME:-"interface_model_v2_$(date +%Y%m%d-%H%M%S)"}
+NAME=${NAME:-"interface$(date +%Y%m%d-%H%M%S)"}
 
 # Print config
 echo "Launching training with:"

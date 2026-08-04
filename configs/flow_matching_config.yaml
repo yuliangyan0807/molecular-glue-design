@@ -11,7 +11,7 @@ model:
       no_v_points: 12
       seq_tfmr_num_heads: 4
       seq_tfmr_num_layers: 2
-      num_blocks: 6
+      num_blocks: 2
       stop_grad: False
   interpolant:
     min_t: 1.e-2
@@ -27,28 +27,35 @@ model:
       sample_schedule: linear
       sigma: 1.0
     seqs:
-      num_classes: 54
       simplex_value: 5.0
+      num_classes: 25
     sampling:
-      num_timesteps: 100
+      num_timesteps: 50
     self_condition: False
   interface_model:
+    path: ./checkpoints/interface-model/latest.pt  # Path to trained interface model checkpoint (set to null if not using pretrained model)
+    trainable: False  # Whether interface model parameters should be trainable (false = frozen)
     feat_dim: 128
+    depth: 4
     num_nearest_neighbors: 16
+    num_att_heads: 50  # K: number of keypoints (must match the checkpoint if loading pretrained weights)
+    topk_k: 25  # Top-k residues to select based on attention scores
 train:
   loss_weights:
-    trans_loss: 1.0
+    trans_loss: 0.008
     rot_loss: 1.0
     seqs_loss: 1.0
-    coords_loss: 1.0
-  max_epochs: 200
+    coords_loss: 10.0
+  max_epochs: 800
   val_freq: 1  # Validate every N epochs
-  save_freq: 20  # Save checkpoint every N epochs (also saves at last epoch)
-  num_val_samples: 10  # Number of samples to validate on (randomly selected from validation set)
-  batch_size: 1
+  save_freq: 50  # Save checkpoint every N epochs (also saves at last epoch)
+  num_val_samples: 5  # Number of samples to validate on (randomly selected from validation set)
+  num_trajectories_per_sample: 4  # Number of trajectories to sample per sample
+  batch_size: 4
   accum_grad: 1
-  seed: 114514
-  max_grad_norm: 100.0
+  use_amp: False  # Use Automatic Mixed Precision (AMP) to reduce memory usage
+  seed: 42
+  max_grad_norm: 50.0
   optimizer:
     type: adam
     lr: 5.e-4 #1.e-4
@@ -57,13 +64,14 @@ train:
     beta2: 0.999
   scheduler:
     type: linear  # Options: plateau, cosine, linear, none
-    end_lr: 1.e-4  # Final learning rate for linear scheduler (only used when type=linear)
+    end_lr: 4.e-4  # Final learning rate for linear scheduler (only used when type=linear)
     # Plateau scheduler options (only used when type=plateau):
     # factor: 0.8
     # patience: 10
     # min_lr: 5.e-6
 
 dataset:
-  path: flow_matching_dataset_v2  # Path to load dataset from disk
+  path: ./data/Moloctite/TernaryDataset_filtered # Path to load dataset from disk
+  # path: ./data/Moloctite/TernaryDataset # Path to load dataset from disk
   train_split: 0.95  # Fraction of data for training
   val_split: 0.05    # Fraction of data for validation
