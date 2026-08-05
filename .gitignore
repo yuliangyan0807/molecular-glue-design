@@ -1,4 +1,3 @@
-DeepTernary/
 data/
 logs/
 *.tmp
@@ -18,6 +17,38 @@ openbabel-openbabel-2-4-0/
 **/__pycache__/
 *.pyc
 
-# Nested git metadata if SeFMol was cloned as its own repo
+# Nested git metadata if vendored as its own repo
 SeFMol/.git/
 SeFMol/.git.bak_nested/
+DeepTernary/.git/
+DeepTernary/.git.bak_nested/
+targetdiff/.git/
+targetdiff/.git.bak_nested/
+
+# DeepTernary: code only (no datasets, checkpoints, run outputs)
+DeepTernary/data/
+DeepTernary/output/
+DeepTernary/results/
+DeepTernary/DockQ/examples/
+DeepTernary/DockQ/*.PDF
+DeepTernary/DockQ/*.pdf
+DeepTernary/DockQ/*.o
+
+# targetdiff: code only (no datasets, pretrained weights, run outputs)
+targetdiff/data/
+targetdiff/outputs_mgd_test/
+targetdiff/outputs*/
+targetdiff/sampling_results/
+targetdiff/pretrained_models/*.pt
+targetdiff/.vina_tmp/
+targetdiff/tmp/
+
+# Ablation scripts and outputs
+ablation_*
+run_ablation*
+
+# Sampling outputs
+sample_outputs/
+
+# torchhub
+torchhub/
