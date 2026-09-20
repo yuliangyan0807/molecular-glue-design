@@ -214,28 +214,3 @@ Use **`triglue_latest.pt`** for paper reproduction. Use `triglue_best.pt` only w
 | `run_evaluation.sh` / `evaluation.py` | RMSD, DockQ, and complex evaluation |
 | `run_eval_ligand.sh` / `eval_ligand.py` | Ligand refinement, molecular properties, and Vina |
 | `sample.sh` / `sample.py` | End-to-end sampling and optional rendering |
-
-## Citation
-
-If you find this work useful, please cite:
-
-```bibtex
-@article{yan2026triglue,
-  title   = {TriGlue: a Biology-Inspired Generative Model for Generating Molecular Glue-Induced Ternary Complex},
-  author  = {Yan, Yuliang and Yan, Shuo and Tang, Haochun and Sun, Yiqin and Dai, Enyan},
-  journal = {arXiv preprint arXiv:2607.22143},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2607.22143}
-}
-
-@article{zhang2026sefmol,
-  title   = {Steering Semi-Flexible Molecular Diffusion Model for Structure-Based Drug Design with Reinforcement Learning},
-  author  = {Zhang, Xudong and Qu, Sanqing and Lu, Fan and Wang, Jianmin and Tian, Zhixin and Gu, Shangding and Zhang, Yanping and Knoll, Alois and Gao, Shaorong and Chen, Guang and Jiang, Changjun},
-  journal = {Science Advances},
-  volume  = {12},
-  number  = {16},
-  year    = {2026},
-  doi     = {10.1126/sciadv.ady9955},
-  url     = {https://www.science.org/doi/10.1126/sciadv.ady9955}
-}
-```
