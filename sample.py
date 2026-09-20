@@ -277,6 +277,7 @@ def load_model(args) -> Tuple[TernaryFlowModel, torch.device]:
                 {
                     "path": getattr(config.model.interface_model, "path", None),
                     "trainable": getattr(config.model.interface_model, "trainable", False),
+                    "finetune_heads_only": getattr(config.model.interface_model, "finetune_heads_only", True),
                     "feat_dim": config.model.interface_model.feat_dim,
                     "depth": getattr(config.model.interface_model, "depth", 4),
                     "num_nearest_neighbors": getattr(config.model.interface_model, "num_nearest_neighbors", 16),
@@ -612,7 +613,7 @@ def main():
                 print(f"[{name}] skipped compare render: missing {gt_pdb}")
             else:
                 try:
-                    from visualization import render_prediction_vs_gt
+                    from plot.visualization import render_prediction_vs_gt
                 except ImportError as exc:
                     print(f"[{name}] compare render skipped (import failed): {exc}")
                 else:

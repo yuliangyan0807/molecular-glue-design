@@ -226,7 +226,15 @@ class EGNN(nn.Module):
             # seems to be needed to keep the network from exploding to NaN with greater depths
             nn.init.normal_(module.weight, std = self.init_eps)
 
-    def forward(self, feats, coors, edges = None, mask = None, adj_mat = None):
+    def forward(
+        self,
+        feats,
+        coors,
+        edges = None,
+        mask = None,
+        adj_mat = None,
+        coor_update_mask = None,
+    ):
         b, n, d, device, fourier_features, num_nearest, valid_radius, only_sparse_neighbors = *feats.shape, feats.device, self.fourier_features, self.num_nearest_neighbors, self.valid_radius, self.only_sparse_neighbors
 
         if exists(mask):
@@ -324,7 +332,19 @@ class EGNN(nn.Module):
                 clamp_value = self.coor_weights_clamp_value
                 coor_weights.clamp_(min = -clamp_value, max = clamp_value)
 
-            coors_out = einsum('b i j, b i j c -> b i c', coor_weights, rel_coors) + coors
+            coor_updates = einsum(
+                'b i j, b i j c -> b i c', coor_weights, rel_coors
+            )
+            if exists(coor_update_mask):
+                if coor_update_mask.shape != coors.shape[:2]:
+                    raise ValueError(
+                        'coor_update_mask must have shape [B, N], got '
+                        f'{coor_update_mask.shape} for coordinates {coors.shape}'
+                    )
+                coor_updates = coor_updates * coor_update_mask.to(
+                    dtype=coor_updates.dtype
+                ).unsqueeze(-1)
+            coors_out = coors + coor_updates
         else:
             coors_out = coors
 
@@ -406,7 +426,8 @@ class EGNN_Network(nn.Module):
         adj_mat = None,
         edges = None,
         mask = None,
-        return_coor_changes = False
+        return_coor_changes = False,
+        coor_update_mask = None,
     ):
         b, device = feats.shape[0], feats.device
 
@@ -420,7 +441,10 @@ class EGNN_Network(nn.Module):
             feats += rearrange(pos_emb, 'n d -> () n d')
 
         if exists(edges) and exists(self.edge_emb):
-            edges = self.edge_emb(edges)
+            # Embedding lookup itself stays stable in FP32, then follows the
+            # node-feature dtype so bond edge features do not promote the
+            # entire AMP EGNN message path back to FP32.
+            edges = self.edge_emb(edges).to(feats.dtype)
 
         # create N-degrees adjacent matrix from 1st degree connections
         if exists(self.num_adj_degrees):
@@ -457,7 +481,14 @@ class EGNN_Network(nn.Module):
             if exists(global_attn):
                 feats, global_tokens = global_attn(feats, global_tokens, mask = mask)
 
-            feats, coors = egnn(feats, coors, adj_mat = adj_mat, edges = edges, mask = mask)
+            feats, coors = egnn(
+                feats,
+                coors,
+                adj_mat=adj_mat,
+                edges=edges,
+                mask=mask,
+                coor_update_mask=coor_update_mask,
+            )
             coor_changes.append(coors)
 
         if return_coor_changes:

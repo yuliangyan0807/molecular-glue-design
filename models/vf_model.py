@@ -13,6 +13,7 @@ from openfold.utils.rigid_utils import Rigid
 
 from utils.constants import AA, BBHeavyAtom, max_num_heavyatoms, MAP_ATOM_TYPE_FULL_TO_INDEX
 from utils.rigid_utils import get_backbone_dihedral_angles, pairwise_dihedrals, kabsch_align
+from utils.so3_utils import calc_rot_vf, vector_to_skew_matrix
 
 from .egnn import EGNN_Network
 
@@ -781,142 +782,334 @@ class InvariantPointAttention(nn.Module):
         
         return s
 
-class Phix(nn.Module):
+class UnifiedTernaryEGNN(nn.Module):
+    """Joint equivariant encoder for protein 1, current protein 2 and ligand.
+
+    All three components are placed in the same graph and processed by one
+    EGNN trunk.  The ligand coordinate and atom heads, and the downstream RT
+    head, therefore consume the same coupled representation.
     """
-    Denoising model for molecular glue coordinates, similar to targetdiff's ScorePosNet3D.
-    Handles two proteins (p1, p2) and a ligand, predicting denoised coordinates and atom types.
-    """
-    def __init__(self, c_s, c_t, hidden_dim, num_layers=3, use_egnn=True, 
-                 use_phia=True, num_classes=25, **egnn_kwargs):
-        """
-        Args:
-            c_s: Feature dimension for protein/ligand features
-            c_t: Time embedding dimension
-            hidden_dim: Hidden dimension for the network
-            num_layers: Number of EGNN layers
-            use_egnn: Whether to use EGNN_Network (True) or custom EGNN (False)
-            use_phia: Whether to use PhiA for atom type prediction (default: True)
-            num_classes: Number of atom type classes for PhiA (default: 25)
-            **egnn_kwargs: Additional arguments for EGNN_Network
-        """
+
+    def __init__(
+        self,
+        c_s,
+        c_t,
+        hidden_dim,
+        num_layers=4,
+        num_nearest_neighbors=32,
+        message_dim=64,
+        num_classes=25,
+        coor_weights_clamp_value=2.0,
+        coordinate_scale=10.0,
+        cross_entity_neighbors=8,
+        num_bond_classes=6,
+        bond_edge_dim=8,
+    ):
         super().__init__()
         self.c_s = c_s
         self.c_t = c_t
         self.hidden_dim = hidden_dim
-        self.use_egnn = use_egnn
-        self.use_phia = use_phia
-        
-        # Project protein features to hidden dimension
+        self.coordinate_scale = float(coordinate_scale)
+        if self.coordinate_scale <= 0:
+            raise ValueError("coordinate_scale must be positive")
+        self.num_nearest_neighbors = int(num_nearest_neighbors)
+        self.cross_entity_neighbors = int(cross_entity_neighbors)
+        self.num_bond_classes = int(num_bond_classes)
+        self.bond_edge_dim = int(bond_edge_dim)
+        if self.num_bond_classes < 2:
+            raise ValueError("num_bond_classes must include no-bond and a bond class")
+        if self.bond_edge_dim <= 0:
+            raise ValueError("bond_edge_dim must be positive")
+        if self.cross_entity_neighbors < 0:
+            raise ValueError("cross_entity_neighbors must be non-negative")
+        # Each receiver has forced edges to both other entity types. Keep room
+        # for its self/local geometric neighbors in the shared KNN budget.
+        if 2 * self.cross_entity_neighbors >= self.num_nearest_neighbors:
+            raise ValueError(
+                "2 * cross_entity_neighbors must be smaller than "
+                "num_nearest_neighbors, got "
+                f"{self.cross_entity_neighbors} and {self.num_nearest_neighbors}"
+            )
+
         self.protein1_emb = nn.Linear(c_s, hidden_dim)
         self.protein2_emb = nn.Linear(c_s, hidden_dim)
-        
-        # Project ligand features (with time embedding) to hidden dimension
-        # Input: ligand features (c_s) + time embedding (c_t)
-        self.ligand_emb = nn.Linear(c_s + c_t, hidden_dim)
+        self.ligand_emb = nn.Linear(c_s, hidden_dim)
+        self.time_emb = nn.Linear(c_t, hidden_dim, bias=False)
+        self.entity_emb = nn.Embedding(3, hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim)
 
         self.refine_net = EGNN_Network(
-            depth=3,
-            dim=c_s,
-            num_nearest_neighbors=16,
+            depth=num_layers,
+            dim=hidden_dim,
+            num_edge_tokens=self.num_bond_classes,
+            edge_dim=self.bond_edge_dim,
+            num_nearest_neighbors=num_nearest_neighbors,
+            m_dim=message_dim,
             norm_coors=True,
-            coor_weights_clamp_value=2.0
+            coor_weights_clamp_value=coor_weights_clamp_value,
+            m_pool_method="mean",
         )
-        
-        # PhiA for atom type prediction using refined features
-        if use_phia:
-            # Project refined features (hidden_dim) back to c_s for PhiA compatibility
-            # Or we can modify PhiA to accept hidden_dim directly
-            self.refined_to_cs = nn.Linear(hidden_dim, c_s)
-            self.phia = PhiA(c_s=c_s, c_t=c_t, hidden_dim=hidden_dim, num_classes=num_classes)
-    
-    def forward(self, s1, p1_coords, s2, p2_coords, sl, X_tilde, t_emb, p1_mask, p2_mask, mol_mask):
-        """
-        Forward pass to predict denoised coordinates and optionally atom types.
-        
-        Args:
-            s1: (B, N1, c_s) - protein 1 features
-            s2: (B, N2, c_s) - protein 2 features  
-            p1_coords: (B, N1, 3) - protein 1 coordinates
-            p2_coords: (B, N2, 3) - protein 2 coordinates
-            sl: (B, N, c_s) - ligand features (initial features)
-            X_tilde: (B, N, 3) - noised ligand coordinates at timestep t
-            t_emb: (B, N, c_t) or (B, c_t) - time embedding
-            p1_mask: (B, N1) - mask for protein 1 residues
-            p2_mask: (B, N2) - mask for protein 2 residues
-            mol_mask: (B, N) - mask for ligand atoms
-            
-        Returns:
-            pred_coords: (B, N, 3) - predicted denoised coordinates
-            phi_probs: (B, N, num_classes) - predicted atom type probabilities (if use_phia=True)
-        """
-        B, N = X_tilde.shape[:2]
+
+        # Atom logits are read directly from the ligand nodes of the shared
+        # graph.  A second protein-ligand attention stack would re-introduce the
+        # decoupling that this module is intended to remove.
+        self.atom_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+        # Symmetric pair features make the i-j and j-i bond predictions
+        # identical by construction. The current noisy bond state is included
+        # directly as well as through EGNN message passing.
+        self.bond_head = nn.Sequential(
+            nn.LayerNorm(2 * hidden_dim + 1 + self.bond_edge_dim),
+            nn.Linear(
+                2 * hidden_dim + 1 + self.bond_edge_dim,
+                hidden_dim,
+            ),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.num_bond_classes),
+        )
+
+    @staticmethod
+    def _add_directed_cross_edges(
+        adjacency,
+        coords,
+        source_slice,
+        target_slice,
+        source_mask,
+        target_mask,
+        num_neighbors,
+    ):
+        """Force nearest cross-entity targets for every valid source node."""
+        source_coords = coords[:, source_slice]
+        target_coords = coords[:, target_slice]
+        target_size = target_coords.shape[1]
+        if num_neighbors <= 0 or target_size == 0:
+            return
+
+        distances = torch.sum(
+            (source_coords.unsqueeze(2) - target_coords.unsqueeze(1)).square(),
+            dim=-1,
+        )
+        valid_pairs = source_mask.unsqueeze(-1) & target_mask.unsqueeze(1)
+        distances = distances.masked_fill(~valid_pairs, float("inf"))
+        k = min(int(num_neighbors), target_size)
+        neighbor_indices = distances.topk(k, dim=-1, largest=False).indices
+
+        edge_block = adjacency[:, source_slice, target_slice]
+        edge_block.scatter_(2, neighbor_indices, True)
+        # topk returns arbitrary padded targets if fewer than k targets are
+        # valid; remove those edges explicitly after scattering.
+        edge_block &= valid_pairs
+
+    def _build_cross_entity_adjacency(
+        self,
+        coords,
+        p1_mask,
+        p2_mask,
+        mol_mask,
+    ):
+        """Build directed P1<->P2, P1<->ligand and P2<->ligand edges."""
+        batch_size = coords.shape[0]
+        n1, n2, nl = p1_mask.shape[1], p2_mask.shape[1], mol_mask.shape[1]
+        total_nodes = n1 + n2 + nl
+        adjacency = torch.zeros(
+            batch_size,
+            total_nodes,
+            total_nodes,
+            dtype=torch.bool,
+            device=coords.device,
+        )
+        entity_slices = (
+            slice(0, n1),
+            slice(n1, n1 + n2),
+            slice(n1 + n2, total_nodes),
+        )
+        entity_masks = (p1_mask.bool(), p2_mask.bool(), mol_mask.bool())
+        for source_idx in range(3):
+            for target_idx in range(3):
+                if source_idx == target_idx:
+                    continue
+                self._add_directed_cross_edges(
+                    adjacency=adjacency,
+                    coords=coords,
+                    source_slice=entity_slices[source_idx],
+                    target_slice=entity_slices[target_idx],
+                    source_mask=entity_masks[source_idx],
+                    target_mask=entity_masks[target_idx],
+                    num_neighbors=self.cross_entity_neighbors,
+                )
+        return adjacency
+
+    def forward(
+        self,
+        s1,
+        p1_coords,
+        s2,
+        p2_coords_current,
+        sl,
+        ligand_coords,
+        t_emb,
+        p1_mask,
+        p2_mask,
+        mol_mask,
+        lig_bond_t,
+    ):
+        B, N = ligand_coords.shape[:2]
         N1 = s1.shape[1]
         N2 = s2.shape[1]
-        
-        # Handle time embedding: expand if needed
-        if t_emb.dim() == 2:  # (B, c_t)
-            t_emb = t_emb.unsqueeze(1).expand(-1, N, -1)  # (B, N, c_t)
-        
-        # Embed protein features
-        h_p1 = self.protein1_emb(s1)  # (B, N1, hidden_dim)
-        h_p2 = self.protein2_emb(s2)  # (B, N2, hidden_dim)
-        
-        # Embed ligand features with time embedding
-        # Concatenate ligand features with time embedding
-        sl_with_time = torch.cat([sl, t_emb], dim=-1)  # (B, N, c_s + c_t)
-        h_ligand = self.ligand_emb(sl_with_time)  # (B, N, hidden_dim)
-        
-        # Combine all features and coordinates
-        # Order: p1, p2, ligand (similar to targetdiff's compose_context)
-        h_all = torch.cat([h_p1, h_p2, h_ligand], dim=1)  # (B, N1+N2+N, hidden_dim)
-        coords_all = torch.cat([p1_coords, p2_coords, X_tilde], dim=1)  # (B, N1+N2+N, 3)
-        
-        # Create overall mask (valid nodes)
-        # This mask indicates which nodes are valid (not padding)
-        mask_all = torch.cat([p1_mask, p2_mask, mol_mask], dim=1)  # (B, N1+N2+N)
-        
-        # Use EGNN_Network to refine features and coordinates
-        # EGNN_Network processes all nodes but we only care about ligand coordinates
-        # Note: In targetdiff, protein coordinates remain fixed during refinement.
-        # Here, EGNN_Network may update all coordinates, but we only extract ligand coordinates.
+
+        if t_emb.dim() == 3:
+            time_context = t_emb[:, 0]
+        elif t_emb.dim() == 2:
+            time_context = t_emb
+        else:
+            raise ValueError(f"Unexpected time embedding shape: {t_emb.shape}")
+        time_context = self.time_emb(time_context).unsqueeze(1)
+
+        entity = self.entity_emb.weight
+        h_p1 = self.protein1_emb(s1) + time_context + entity[0]
+        h_p2 = self.protein2_emb(s2) + time_context + entity[1]
+        h_ligand = self.ligand_emb(sl) + time_context + entity[2]
+        h_all = self.input_norm(torch.cat([h_p1, h_p2, h_ligand], dim=1))
+        coords_all = torch.cat(
+            [p1_coords, p2_coords_current, ligand_coords], dim=1
+        )
+        mask_all = torch.cat(
+            [p1_mask.bool(), p2_mask.bool(), mol_mask.bool()], dim=1
+        )
+        # Protein geometry is conditioning information and must remain rigid.
+        # All nodes still exchange messages and update features, but only valid
+        # ligand nodes are allowed to receive EGNN coordinate updates.
+        coor_update_mask = torch.cat(
+            [
+                torch.zeros_like(p1_mask, dtype=torch.bool),
+                torch.zeros_like(p2_mask, dtype=torch.bool),
+                mol_mask.bool(),
+            ],
+            dim=1,
+        )
+
+        # Centering and scaling are SE(3)-compatible and keep squared-distance
+        # inputs well-conditioned for complexes whose pose translation is
+        # hundreds of Angstroms.
+        coord_weights = mask_all.to(coords_all.dtype).unsqueeze(-1)
+        coord_center = (
+            (coords_all * coord_weights).sum(dim=1, keepdim=True)
+            / coord_weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        )
+        coords_normalized = (
+            coords_all - coord_center
+        ) / self.coordinate_scale
+        cross_entity_adjacency = self._build_cross_entity_adjacency(
+            coords=coords_normalized,
+            p1_mask=p1_mask,
+            p2_mask=p2_mask,
+            mol_mask=mol_mask,
+        )
+
+        if lig_bond_t.shape != (B, N, N):
+            raise ValueError(
+                "lig_bond_t must have shape (B, L, L), got "
+                f"{tuple(lig_bond_t.shape)} for B={B}, L={N}"
+            )
+        ligand_pair_mask = mol_mask.unsqueeze(2) & mol_mask.unsqueeze(1)
+        lig_bond_t = torch.where(
+            ligand_pair_mask,
+            lig_bond_t.long(),
+            torch.zeros_like(lig_bond_t, dtype=torch.long),
+        )
+        if lig_bond_t.numel() and (
+            lig_bond_t.min().item() < 0
+            or lig_bond_t.max().item() >= self.num_bond_classes
+        ):
+            raise ValueError(
+                f"lig_bond_t values must be in [0, {self.num_bond_classes})"
+            )
+
+        # Edge token 0 means no chemical bond (and is also used for all
+        # protein/cross-entity edges). Only the ligand-ligand block carries the
+        # current noisy bond state.
+        total_nodes = coords_all.shape[1]
+        edge_tokens = torch.zeros(
+            B,
+            total_nodes,
+            total_nodes,
+            dtype=torch.long,
+            device=coords_all.device,
+        )
+        ligand_start = N1 + N2
+        edge_tokens[
+            :, ligand_start:ligand_start + N, ligand_start:ligand_start + N
+        ] = lig_bond_t
+
         refined_feats, refined_coords = self.refine_net(
             feats=h_all,
-            coors=coords_all,
+            coors=coords_normalized,
+            adj_mat=cross_entity_adjacency,
+            edges=edge_tokens,
             mask=mask_all,
-            return_coor_changes=False
+            return_coor_changes=False,
+            coor_update_mask=coor_update_mask,
         )
-        
-        # Extract only ligand coordinates (last N coordinates)
-        # This gives us the denoised ligand coordinates
-        pred_coords = refined_coords[:, N1+N2:, :]  # (B, N, 3)
-        
-        # Extract refined features for all components (p1, p2, ligand)
-        # Order in refined_feats: [p1, p2, ligand]
-        refined_p1_feats = refined_feats[:, :N1, :]  # (B, N1, hidden_dim)
-        refined_p2_feats = refined_feats[:, N1:N1+N2, :]  # (B, N2, hidden_dim)
-        refined_ligand_feats = refined_feats[:, N1+N2:, :]  # (B, N, hidden_dim)
-        
-        # Use PhiA to predict atom type probabilities from refined features
-        if self.use_phia:
-            # Project refined features back to c_s dimension for PhiA compatibility
-            refined_p1_feats_cs = self.refined_to_cs(refined_p1_feats)  # (B, N1, c_s)
-            refined_p2_feats_cs = self.refined_to_cs(refined_p2_feats)  # (B, N2, c_s)
-            refined_ligand_feats_cs = self.refined_to_cs(refined_ligand_feats)  # (B, N, c_s)
-            
-            # Use PhiA to predict atom type probabilities with refined features
-            phi_probs = self.phia(
-                s1=refined_p1_feats_cs,  # Use refined p1 features
-                s2=refined_p2_feats_cs,  # Use refined p2 features
-                sl=refined_ligand_feats_cs,  # Use refined ligand features
-                t_emb=t_emb,
-                p1_mask=p1_mask,
-                p2_mask=p2_mask,
-                mol_mask=mol_mask
-            )  # (B, N, num_classes)
-            
-            return pred_coords, phi_probs
-        else:
-            return pred_coords
+        refined_coords = (
+            refined_coords * self.coordinate_scale + coord_center
+        )
+
+        p1_feats = refined_feats[:, :N1]
+        p2_feats = refined_feats[:, N1:N1 + N2]
+        lig_feats = refined_feats[:, N1 + N2:]
+        # Return the exact input protein coordinates (rather than a numerically
+        # round-tripped centered/scaled copy) so downstream RT geometry cannot
+        # accidentally interpret protein coordinate refinement as motion.
+        p1_coords_out = p1_coords
+        p2_coords_out = p2_coords_current
+        lig_coords_out = refined_coords[:, N1 + N2:]
+
+        # Preserve padded coordinates exactly; downstream geometric reductions
+        # additionally receive the masks.
+        lig_coords_out = torch.where(
+            mol_mask.unsqueeze(-1), lig_coords_out, ligand_coords
+        )
+        atom_logits = self.atom_head(lig_feats) * mol_mask.unsqueeze(-1)
+
+        lig_i = lig_feats.unsqueeze(2)
+        lig_j = lig_feats.unsqueeze(1)
+        pair_sum = lig_i + lig_j
+        pair_abs_diff = torch.abs(lig_i - lig_j)
+        pair_dist_sq = torch.sum(
+            (lig_coords_out.unsqueeze(2) - lig_coords_out.unsqueeze(1)).square(),
+            dim=-1,
+            keepdim=True,
+        ) / (self.coordinate_scale ** 2)
+        current_bond_emb = self.refine_net.edge_emb(lig_bond_t).to(
+            lig_feats.dtype
+        )
+        bond_pair_features = torch.cat(
+            [pair_sum, pair_abs_diff, pair_dist_sq, current_bond_emb], dim=-1
+        )
+        bond_logits = self.bond_head(bond_pair_features)
+        bond_logits = 0.5 * (
+            bond_logits + bond_logits.transpose(1, 2)
+        )
+        off_diagonal = ~torch.eye(
+            N, dtype=torch.bool, device=mol_mask.device
+        ).unsqueeze(0)
+        bond_pair_mask = ligand_pair_mask & off_diagonal
+        bond_logits = bond_logits * bond_pair_mask.unsqueeze(-1)
+
+        return (
+            lig_coords_out,
+            atom_logits,
+            bond_logits,
+            p1_feats,
+            p2_feats,
+            lig_feats,
+            p1_coords_out,
+            p2_coords_out,
+        )
 
 class PhiX(nn.Module):
     """
@@ -1295,63 +1488,329 @@ class PhiA(nn.Module):
 
 class PhiRT(nn.Module):
     """
-    Lightweight PhiRT that predicts R_inv and t_inv using global interface
-    geometry plus current noisy state/time context:
-        - R_star, t_star from Kabsch on (Y1, Y2)
-        - approximate mu1, mu2 as means of Y1, Y2
-        - R_tilde, t_tilde (current noisy rigid state)
-        - t_emb (projected global timestep embedding)
+    Ligand-conditioned vector field on SO(3) x R^3.
+
+    The current noisy pose ``(R_tilde, t_tilde)`` is the base point of the
+    field.  The network builds invariant scalar weights from all three
+    components and combines them with equivariant geometric vector bases to
+    predict:
+
+      * ``rot_vf``: a body-frame angular velocity (right-trivialized tangent),
+      * ``trans_vf``: a world-frame translational velocity.
+
+    ``R_star``/``t_star`` are only geometric prior features.  They are never
+    used as the state from which an update starts, so repeated denoising calls
+    do not reset the trajectory to the same Kabsch solution.
     """
 
-    def __init__(self, c_s, c_t, hidden_dim, num_heads: int = 4):
-        # c_s, c_t, num_heads are kept for API compatibility; only hidden_dim is used.
+    def __init__(
+        self,
+        c_s,
+        c_t,
+        hidden_dim,
+        num_heads: int = 4,
+        translation_scale: float = 50.0,
+        force_neighbors: int = 8,
+        force_num_heads: int = 8,
+    ):
+        # num_heads is retained for configuration compatibility.
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.context_dim = 32
+        self.cross_dim = 32
+        self.num_vector_bases = 6
+        self.translation_scale = float(translation_scale)
+        self.max_rotation_speed = math.pi
+        self.force_neighbors = int(force_neighbors)
+        self.force_num_heads = int(force_num_heads)
+        self.interface_ablation = "none"
+        if self.force_neighbors <= 0:
+            raise ValueError("force_neighbors must be positive")
+        if self.force_num_heads <= 0:
+            raise ValueError("force_num_heads must be positive")
 
-        # Input: [flatten(R_*), t_*, mu1, mu2, flatten(R_tilde), t_tilde, t_ctx]
-        # dim = 9 + 3 + 3 + 3 + 9 + 3 + 3 = 33
-        in_dim = 33
-
-        self.trunk = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        # IPA/node outputs are invariant scalar features.  Ligand features are
+        # included explicitly instead of allowing RT to see only the proteins.
+        self.ternary_context_proj = nn.Sequential(
+            nn.Linear(3 * c_s, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Linear(hidden_dim, self.context_dim),
         )
-        # Initial global prediction heads
-        self.rot_head = nn.Linear(hidden_dim, 6)   # 6D rotation representation
-        self.trans_head = nn.Linear(hidden_dim, 3)  # translation vector
-
-        # Per-step refinement blocks, similar in spirit to GAEncoder trunk blocks.
-        self.num_refine_steps = 2
-        self.enc = nn.ModuleDict()
-        self.rot_head_refine = nn.ModuleDict()
-        self.trans_head_refine = nn.ModuleDict()
-        for b in range(self.num_refine_steps):
-            self.enc[f"encoder_{b}"] = nn.Sequential(
-                nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.time_context_proj = nn.Sequential(
+            nn.Linear(c_t, hidden_dim),
             nn.ReLU(),
+            nn.Linear(hidden_dim, self.context_dim),
         )
-            self.rot_head_refine[f"rot_head_{b}"] = nn.Linear(hidden_dim, 6)
-            self.trans_head_refine[f"trans_head_{b}"] = nn.Linear(hidden_dim, 3)
 
-        # Project global timestep context to a compact 3D feature.
-        self.t_proj = nn.Linear(c_t, 3)
+        self.p1_cross_proj = nn.Linear(c_s, self.cross_dim, bias=False)
+        self.p2_cross_proj = nn.Linear(c_s, self.cross_dim, bias=False)
+        self.lig_cross_proj = nn.Linear(c_s, self.cross_dim, bias=False)
+
+        num_rbf = 16
+        self.register_buffer("rbf_centers", torch.linspace(0.0, 30.0, num_rbf))
+        self.rbf_width = 30.0 / (num_rbf - 1)
+        self.p1_lig_distance_bias = nn.Sequential(
+            nn.Linear(num_rbf, self.cross_dim),
+            nn.SiLU(),
+            nn.Linear(self.cross_dim, 1),
+        )
+        self.p2_lig_distance_bias = nn.Sequential(
+            nn.Linear(num_rbf, self.cross_dim),
+            nn.SiLU(),
+            nn.Linear(self.cross_dim, 1),
+        )
+
+        # Learned local SE(3) field on directed P2->P1 and P2->ligand edges.
+        # The MLP emits invariant scalar coefficients; multiplying them by
+        # relative directions and moment arms produces equivariant force and
+        # torque vectors. Entity embeddings distinguish protein and ligand
+        # targets while sharing the edge encoder.
+        self.force_entity_dim = 8
+        self.force_entity_emb = nn.Embedding(2, self.force_entity_dim)
+        force_edge_dim = (
+            2 * self.cross_dim
+            + num_rbf
+            + self.context_dim
+            + self.force_entity_dim
+        )
+        self.force_torque_edge_mlp = nn.Sequential(
+            nn.Linear(force_edge_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * self.force_num_heads),
+        )
+
+        # Twelve invariant geometric statistics plus ternary/time contexts.
+        num_global_invariants = 12
+        self.field_weight_head = nn.Sequential(
+            nn.Linear(
+                num_global_invariants + 2 * self.context_dim,
+                hidden_dim,
+            ),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * self.num_vector_bases),
+        )
+
+        # A zero field is a safe initial condition under AMP.  The final layer
+        # learns first; gradients then flow into the cross-component encoders.
+        nn.init.zeros_(self.field_weight_head[-1].weight)
+        nn.init.zeros_(self.field_weight_head[-1].bias)
+        nn.init.zeros_(self.force_torque_edge_mlp[-1].weight)
+        nn.init.zeros_(self.force_torque_edge_mlp[-1].bias)
 
     @staticmethod
-    def _rot6d_to_rotmat(rot_6d: torch.Tensor) -> torch.Tensor:
-        """Convert 6D rotation representation to rotation matrix (columns)."""
-        a1 = rot_6d[:, 0:3]
-        a2 = rot_6d[:, 3:6]
-        b1 = F.normalize(a1, dim=-1)
-        proj = (b1 * a2).sum(dim=-1, keepdim=True) * b1
-        b2 = F.normalize(a2 - proj, dim=-1)
-        b3 = torch.cross(b1, b2, dim=-1)
-        return torch.stack([b1, b2, b3], dim=-1)
+    def _remove_singleton_rigid_axis(
+        rotation: torch.Tensor,
+        translation: torch.Tensor,
+    ):
+        if rotation.ndim == 4:
+            if rotation.shape[1] != 1:
+                raise ValueError(
+                    f"Expected a singleton rigid axis, got rotation {rotation.shape}"
+                )
+            rotation = rotation[:, 0]
+        if translation.ndim == 3:
+            if translation.shape[1] != 1:
+                raise ValueError(
+                    f"Expected a singleton rigid axis, got translation {translation.shape}"
+                )
+            translation = translation[:, 0]
+        return rotation, translation
 
-    def forward(self, Y1, Y2, s1, p1_coords, s2, p2_coords, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2):
+    @staticmethod
+    def _masked_mean(features: torch.Tensor, mask: torch.Tensor):
+        weights = mask.to(dtype=features.dtype).unsqueeze(-1)
+        return (features * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _dot(lhs: torch.Tensor, rhs: torch.Tensor):
+        return torch.sum(lhs * rhs, dim=-1)
+
+    @staticmethod
+    def _signed_log1p(value: torch.Tensor):
+        """Compress scalar ranges without changing their SO(3) invariance."""
+        return torch.sign(value) * torch.log1p(torch.abs(value))
+
+    @staticmethod
+    def _safe_unit(vector: torch.Tensor, eps: float = 1e-8):
+        norm = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        return vector / norm.clamp_min(eps)
+
+    @staticmethod
+    def _clip_vector_norm(vector: torch.Tensor, max_norm: float):
+        """Equivariant radial clipping; unlike component clipping, this preserves rotations."""
+        norm = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        scale = torch.clamp(max_norm / norm.clamp_min(1e-8), max=1.0)
+        return vector * scale
+
+    def _rbf(self, distances: torch.Tensor):
+        return torch.exp(
+            -0.5
+            * ((distances.unsqueeze(-1) - self.rbf_centers) / self.rbf_width).square()
+        )
+
+    @staticmethod
+    def _gather_neighbors(values: torch.Tensor, indices: torch.Tensor):
+        """Gather [B, M, ...] values into [B, N, K, ...]."""
+        batch_indices = torch.arange(
+            values.shape[0], device=values.device
+        )[:, None, None]
+        return values[batch_indices, indices]
+
+    def _force_torque_from_target(
+        self,
+        p2_features,
+        p2_coords,
+        p2_mask,
+        p2_center,
+        p2_radius,
+        target_features,
+        target_coords,
+        target_mask,
+        time_context,
+        entity_index,
+    ):
+        """Aggregate multi-head force/torque from one target entity type."""
+        target_size = target_coords.shape[1]
+        if target_size == 0:
+            zeros = p2_coords.new_zeros(
+                p2_coords.shape[0], self.force_num_heads, 3
+            )
+            return zeros, zeros
+
+        pair_distances = torch.cdist(p2_coords, target_coords)
+        pair_mask = p2_mask.unsqueeze(-1) & target_mask.unsqueeze(1)
+        pair_distances = pair_distances.masked_fill(~pair_mask, float("inf"))
+        k = min(self.force_neighbors, target_size)
+        neighbor_distances, neighbor_indices = pair_distances.topk(
+            k, dim=-1, largest=False
+        )
+
+        target_features_k = self._gather_neighbors(
+            target_features, neighbor_indices
+        )
+        target_coords_k = self._gather_neighbors(
+            target_coords, neighbor_indices
+        )
+        target_mask_k = self._gather_neighbors(
+            target_mask, neighbor_indices
+        )
+        edge_mask = p2_mask.unsqueeze(-1) & target_mask_k
+
+        p2_features_k = p2_features.unsqueeze(2).expand(
+            -1, -1, k, -1
+        )
+        time_k = time_context[:, None, None].expand(
+            -1, p2_coords.shape[1], k, -1
+        )
+        entity_ids = torch.full(
+            neighbor_indices.shape,
+            int(entity_index),
+            dtype=torch.long,
+            device=p2_coords.device,
+        )
+        edge_features = torch.cat(
+            [
+                p2_features_k,
+                target_features_k,
+                self._rbf(neighbor_distances.clamp_max(1.0e4)),
+                time_k,
+                self.force_entity_emb(entity_ids),
+            ],
+            dim=-1,
+        )
+        edge_coefficients = self.force_torque_edge_mlp(edge_features)
+        trans_coefficients, rot_coefficients = edge_coefficients.chunk(2, dim=-1)
+        valid = edge_mask.to(dtype=edge_coefficients.dtype).unsqueeze(-1)
+        trans_coefficients = trans_coefficients * valid
+        rot_coefficients = rot_coefficients * valid
+
+        relative_direction = self._safe_unit(
+            target_coords_k - p2_coords.unsqueeze(2)
+        )
+        # Normalize the moment arm so equally rotated proteins of different
+        # physical sizes produce comparable torque magnitudes.
+        moment_arm = (
+            p2_coords - p2_center.unsqueeze(1)
+        ) / p2_radius[:, None, None]
+        torque_direction = torch.linalg.cross(
+            moment_arm.unsqueeze(2), relative_direction, dim=-1
+        )
+
+        force_heads = torch.einsum(
+            "bikh,bikd->bhd", trans_coefficients, relative_direction
+        )
+        torque_heads = torch.einsum(
+            "bikh,bikd->bhd", rot_coefficients, torque_direction
+        )
+        # Mean aggregation prevents large proteins from receiving a larger
+        # field solely because they contain more residues/edges.
+        edge_count = edge_mask.sum(dim=(1, 2)).to(
+            dtype=force_heads.dtype
+        ).clamp_min(1.0)
+        return (
+            force_heads / edge_count[:, None, None],
+            torque_heads / edge_count[:, None, None],
+        )
+
+    @staticmethod
+    def _global_pair_weights(
+        source_features: torch.Tensor,
+        target_features: torch.Tensor,
+        distances: torch.Tensor,
+        pair_mask: torch.Tensor,
+        distance_bias: nn.Module,
+    ):
+        """Return one normalized, masked contact distribution per complex."""
+        logits = torch.einsum(
+            "bid,bjd->bij", source_features, target_features
+        ) / math.sqrt(source_features.shape[-1])
+        logits = logits + distance_bias(distances).squeeze(-1)
+        logits = logits.masked_fill(~pair_mask, -1.0e4)
+        weights = torch.softmax(logits.flatten(1), dim=-1).view_as(logits)
+        weights = weights * pair_mask.to(dtype=weights.dtype)
+        return weights / weights.sum(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+
+    @staticmethod
+    def _weighted_pair_points(
+        weights: torch.Tensor,
+        source_coords: torch.Tensor,
+        target_coords: torch.Tensor,
+    ):
+        source_point = torch.einsum("bij,bid->bd", weights, source_coords)
+        target_point = torch.einsum("bij,bjd->bd", weights, target_coords)
+        return source_point, target_point
+
+    # The RT head performs small, numerically sensitive geometric operations
+    # (cross products and matrix exponentials). Run this head in FP32 while the
+    # large encoder/IPA activations remain under AMP.
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
+    def forward(
+        self,
+        Y1,
+        Y2,
+        R_star,
+        t_star,
+        R_tilde,
+        t_tilde,
+        t,
+        t_emb,
+        s1,
+        s2,
+        s_l,
+        p1_mask,
+        p2_mask,
+        mol_mask,
+        p1_coords,
+        p2_coords,
+        lig_coords,
+        sigma_1,
+        sigma_2,
+        p2_coords_current=None,
+    ):
         """
         Args:
             Y1, Y2: (B, K, 3) interface keypoints for protein 1 and 2
@@ -1359,62 +1818,298 @@ class PhiRT(nn.Module):
             t_star: (B, 3) initial translation from Kabsch
             R_tilde: (B, 3, 3) or (B, 1, 3, 3), current noisy rotation state
             t_tilde: (B, 3) or (B, 1, 3), current noisy translation state
-            t_emb: (B, N, c_t), per-token timestep embedding
+            t_emb: (B, N_lig, c_t), per-token timestep embedding
+            s_l: (B, N_lig, c_s), current ligand atom representation
+            lig_coords: (B, N_lig, 3), current ligand coordinates
         
         Returns:
-            R_pred: (B, 3, 3) predicted rotation matrix (R_inv)
-            t_pred: (B, 3)   predicted translation vector (t_inv)
+            R_endpoint: endpoint estimate derived from the current state/field
+            t_endpoint: endpoint translation estimate
+            rot_vf: body-frame angular velocity at the current state
+            trans_vf: world-frame translation velocity at the current state
         """
         B = R_star.shape[0]
+        R_tilde, t_tilde = self._remove_singleton_rigid_axis(
+            R_tilde, t_tilde
+        )
 
-        mask = p2_mask.float()                       # (B, N2)
-        mask_sum = mask.sum(dim=1, keepdim=True)    # (B, 1)
-        mask_sum = mask_sum.clamp(min=1e-6)
+        p1_mask = p1_mask.bool()
+        p2_mask = p2_mask.bool()
+        mol_mask = mol_mask.bool()
+        pair_mask_p1_lig = p1_mask.unsqueeze(2) & mol_mask.unsqueeze(1)
+        pair_mask_p2_lig = p2_mask.unsqueeze(2) & mol_mask.unsqueeze(1)
 
-        # Approximate mu1, mu2 as the means of Y1 and Y2.
-        # Shapes: (B, 3)
+        # Interface keypoints always follow the exact rigid flow state.  The
+        # shared EGNN may additionally provide an equivariantly refined current
+        # P2 representation for learned contact geometry.
+        Y2_current = Y2 @ R_tilde.transpose(1, 2) + t_tilde.unsqueeze(1)
+        if p2_coords_current is None:
+            p2_current = (
+                p2_coords @ R_tilde.transpose(1, 2) + t_tilde.unsqueeze(1)
+            )
+        else:
+            p2_current = p2_coords_current
+
         mu1 = Y1.mean(dim=1)
-        mu2 = Y2.mean(dim=1)
+        mu2_current = Y2_current.mean(dim=1)
+        p1_center = self._masked_mean(p1_coords, p1_mask)
+        p2_center = self._masked_mean(p2_coords, p2_mask)
+        p2_center_current = self._masked_mean(p2_current, p2_mask)
+        lig_center = self._masked_mean(lig_coords, mol_mask)
 
-        # Build global context from timestep embedding.
-        t_ctx = self.t_proj(t_emb.mean(dim=1))  # (B, 3)
+        ternary_context = self.ternary_context_proj(
+            torch.cat(
+                [
+                    self._masked_mean(s1, p1_mask),
+                    self._masked_mean(s2, p2_mask),
+                    self._masked_mean(s_l, mol_mask),
+                ],
+                dim=-1,
+            )
+        )
+        time_context = self.time_context_proj(
+            self._masked_mean(t_emb, mol_mask)
+        )
 
-        # Flatten rigid states and build input feature.
-        R_flat = R_star.reshape(B, 9)
-        R_tilde_flat = R_tilde.reshape(B, 9)
-        t_tilde_flat = t_tilde.reshape(B, 3)
-        x = torch.cat([R_flat, t_star, mu1, mu2, R_tilde_flat, t_tilde_flat, t_ctx], dim=-1)  # (B, 33)
+        # Learned, chemistry-aware contact distributions for P1-ligand and
+        # current-P2-ligand.  They supply the RT field with the ternary geometry
+        # that the old protein-only head could not observe.
+        p1_lig_offsets = lig_coords.unsqueeze(1) - p1_coords.unsqueeze(2)
+        p2_lig_offsets = lig_coords.unsqueeze(1) - p2_current.unsqueeze(2)
+        p1_lig_dist = torch.linalg.vector_norm(p1_lig_offsets, dim=-1)
+        p2_lig_dist = torch.linalg.vector_norm(p2_lig_offsets, dim=-1)
 
+        lig_cross = self.lig_cross_proj(s_l)
+        p1_lig_weights = self._global_pair_weights(
+            self.p1_cross_proj(s1),
+            lig_cross,
+            self._rbf(p1_lig_dist),
+            pair_mask_p1_lig,
+            self.p1_lig_distance_bias,
+        )
+        p2_lig_weights = self._global_pair_weights(
+            self.p2_cross_proj(s2),
+            lig_cross,
+            self._rbf(p2_lig_dist),
+            pair_mask_p2_lig,
+            self.p2_lig_distance_bias,
+        )
 
-        h = self.trunk(x)
-        rot_6d = self.rot_head(h)
-        t_pred = self.trans_head(h)
+        p1_contact, lig_contact_from_p1 = self._weighted_pair_points(
+            p1_lig_weights, p1_coords, lig_coords
+        )
+        p2_contact, lig_contact_from_p2 = self._weighted_pair_points(
+            p2_lig_weights, p2_current, lig_coords
+        )
 
-        R_pred = self._rot6d_to_rotmat(rot_6d)
+        key_displacement = Y1 - Y2_current
+        mean_key_displacement = key_displacement.mean(dim=1)
+        r2_key = Y2_current - mu2_current.unsqueeze(1)
+        key_torque = torch.linalg.cross(
+            r2_key, key_displacement, dim=-1
+        ).mean(dim=1)
 
-        # Iterative refinement block
-        for b in range(self.num_refine_steps):
-            p2_coords = p2_coords @ R_pred.transpose(1, 2) + t_pred.unsqueeze(1)
+        p2_lig_torque = torch.einsum(
+            "bij,bijd->bd",
+            p2_lig_weights,
+            torch.linalg.cross(
+                p2_current.unsqueeze(2) - p2_center_current[:, None, None],
+                p2_lig_offsets,
+                dim=-1,
+            ),
+        )
 
-            mu1 = Y1.mean(dim=1)
-            mu2 = (p2_coords * mask.unsqueeze(-1)).sum(dim=1) / mask_sum
+        # Kabsch contributes a direction/prior, never an absolute reset.
+        p2_center_kabsch = (
+            torch.bmm(
+                p2_center.unsqueeze(1), R_star.transpose(1, 2)
+            ).squeeze(1)
+            + t_star
+        )
+        kabsch_center_displacement = p2_center_kabsch - p2_center_current
+        kabsch_rot_body = calc_rot_vf(R_tilde, R_star)
+        kabsch_rot_world = torch.bmm(
+            R_tilde, kabsch_rot_body.unsqueeze(-1)
+        ).squeeze(-1)
 
-            x = torch.cat(
-                [R_pred.reshape(B, 9), t_pred, mu1, mu2, R_tilde_flat, t_tilde_flat, t_ctx],
-                dim=-1
+        interface_from_p1 = mu1 - p1_center
+        interface_from_p2 = mu2_current - p2_center_current
+        ligand_to_p2 = lig_center - p2_center_current
+        ligand_contact_displacement = lig_contact_from_p2 - p2_contact
+        neosurface_displacement = lig_contact_from_p1 - p2_contact
+
+        sigma_2_current = R_tilde @ sigma_2 @ R_tilde.transpose(1, 2)
+        covariance_error_sq = torch.sum(
+            (sigma_1 - sigma_2_current).square(), dim=(-1, -2)
+        )
+        expected_p1_lig_dist = torch.sum(
+            p1_lig_weights * p1_lig_dist, dim=(1, 2)
+        )
+        expected_p2_lig_dist = torch.sum(
+            p2_lig_weights * p2_lig_dist, dim=(1, 2)
+        )
+
+        ablation = self.interface_ablation
+        valid_ablations = {
+            "none",
+            "no_pose_prior",
+            "no_virtual_interface",
+            "no_interface",
+        }
+        if ablation not in valid_ablations:
+            raise ValueError(
+                f"Unknown interface ablation {ablation!r}; expected one of "
+                f"{sorted(valid_ablations)}"
             )
 
-            h = self.enc[f"encoder_{b}"](x)
+        # Counterfactual inference ablations. Only interface-derived quantities
+        # are removed; ternary representations, ligand contacts, and the local
+        # force--torque field remain identical to the full model.
+        if ablation in {"no_virtual_interface", "no_interface"}:
+            mean_key_displacement = torch.zeros_like(mean_key_displacement)
+            key_torque = torch.zeros_like(key_torque)
+            interface_from_p1 = torch.zeros_like(interface_from_p1)
+            interface_from_p2 = torch.zeros_like(interface_from_p2)
+            covariance_error_sq = torch.zeros_like(covariance_error_sq)
+        if ablation in {"no_pose_prior", "no_interface"}:
+            kabsch_center_displacement = torch.zeros_like(
+                kabsch_center_displacement
+            )
+            kabsch_rot_body = torch.zeros_like(kabsch_rot_body)
+            kabsch_rot_world = torch.zeros_like(kabsch_rot_world)
 
-            t_pred_delta = self.trans_head_refine[f"trans_head_{b}"](h)
+        global_invariants = torch.stack(
+            [
+                self._dot(mean_key_displacement, mean_key_displacement),
+                self._dot(ligand_contact_displacement, ligand_contact_displacement),
+                self._dot(neosurface_displacement, neosurface_displacement),
+                self._dot(ligand_to_p2, ligand_to_p2),
+                self._dot(kabsch_center_displacement, kabsch_center_displacement),
+                self._dot(kabsch_rot_body, kabsch_rot_body),
+                expected_p1_lig_dist,
+                expected_p2_lig_dist,
+                covariance_error_sq,
+                self._dot(mean_key_displacement, ligand_contact_displacement),
+                self._dot(ligand_contact_displacement, kabsch_center_displacement),
+                self._dot(interface_from_p1, interface_from_p2),
+            ],
+            dim=-1,
+        )
+        global_invariants = self._signed_log1p(global_invariants)
+        field_weights = self.field_weight_head(
+            torch.cat(
+                [global_invariants, ternary_context, time_context], dim=-1
+            )
+        )
 
-            rot_6d = self.rot_head_refine[f"rot_head_{b}"](h)
-            R_pred_delta = self._rot6d_to_rotmat(rot_6d)
+        translation_bases = torch.stack(
+            [
+                mean_key_displacement,
+                ligand_contact_displacement,
+                neosurface_displacement,
+                ligand_to_p2,
+                kabsch_center_displacement,
+                p1_contact - p2_contact,
+            ],
+            dim=1,
+        )
+        rotation_bases_world = torch.stack(
+            [
+                key_torque,
+                p2_lig_torque,
+                torch.linalg.cross(
+                    p2_contact - p2_center_current,
+                    ligand_contact_displacement,
+                    dim=-1,
+                ),
+                kabsch_rot_world,
+                torch.linalg.cross(
+                    interface_from_p2, interface_from_p1, dim=-1
+                ),
+                torch.linalg.cross(
+                    p2_contact - p2_center_current,
+                    neosurface_displacement,
+                    dim=-1,
+                ),
+            ],
+            dim=1,
+        )
 
-            R_pred = R_pred @ R_pred_delta
-            t_pred = t_pred + t_pred_delta
+        trans_vf = torch.sum(
+            field_weights[:, : self.num_vector_bases].unsqueeze(-1)
+            * self._safe_unit(translation_bases),
+            dim=1,
+        )
+        rot_vf_world = torch.sum(
+            field_weights[:, self.num_vector_bases :].unsqueeze(-1)
+            * self._safe_unit(rotation_bases_world),
+            dim=1,
+        )
 
-        return R_pred, t_pred
+        # Local learned residual field. Unlike the six global bases above,
+        # this retains residue/atom-level P2->P1 and P2->ligand interactions.
+        p2_force_features = self.p2_cross_proj(s2)
+        p2_radius = torch.sqrt(
+            self._masked_mean(
+                torch.sum(
+                    (p2_current - p2_center_current.unsqueeze(1)).square(),
+                    dim=-1,
+                    keepdim=True,
+                ),
+                p2_mask,
+            )[:, 0]
+        ).clamp_min(1.0)
+        p1_force_heads, p1_torque_heads = self._force_torque_from_target(
+            p2_features=p2_force_features,
+            p2_coords=p2_current,
+            p2_mask=p2_mask,
+            p2_center=p2_center_current,
+            p2_radius=p2_radius,
+            target_features=self.p1_cross_proj(s1),
+            target_coords=p1_coords,
+            target_mask=p1_mask,
+            time_context=time_context,
+            entity_index=0,
+        )
+        lig_force_heads, lig_torque_heads = self._force_torque_from_target(
+            p2_features=p2_force_features,
+            p2_coords=p2_current,
+            p2_mask=p2_mask,
+            p2_center=p2_center_current,
+            p2_radius=p2_radius,
+            target_features=lig_cross,
+            target_coords=lig_coords,
+            target_mask=mol_mask,
+            time_context=time_context,
+            entity_index=1,
+        )
+        head_scale = math.sqrt(float(self.force_num_heads))
+        learned_force_world = (
+            p1_force_heads + lig_force_heads
+        ).sum(dim=1) / head_scale
+        learned_torque_world = (
+            p1_torque_heads + lig_torque_heads
+        ).sum(dim=1) / head_scale
+        trans_vf = trans_vf + learned_force_world
+        rot_vf_world = rot_vf_world + learned_torque_world
+        # calc_rot_vf/geodesic_t use a right-trivialized (body-frame) tangent.
+        rot_vf = torch.bmm(
+            R_tilde.transpose(1, 2), rot_vf_world.unsqueeze(-1)
+        ).squeeze(-1)
+        rot_vf = self._clip_vector_norm(rot_vf, self.max_rotation_speed)
+
+        # Keep an endpoint estimate for the ligand coordinate head and existing
+        # output/visualization code.  Flow integration itself uses rot_vf/trans_vf.
+        remaining = (1.0 - t[:, 0]).clamp(min=0.0, max=1.0)
+        delta_R_to_endpoint = torch.matrix_exp(
+            vector_to_skew_matrix(remaining.unsqueeze(-1) * rot_vf)
+        )
+        R_endpoint = R_tilde @ delta_R_to_endpoint
+        t_endpoint = t_tilde + (
+            remaining.unsqueeze(-1) * self.translation_scale * trans_vf
+        )
+
+        return R_endpoint, t_endpoint, rot_vf, trans_vf
 
 class BackboneUpdateLocal(nn.Module):
     """
@@ -1599,36 +2294,61 @@ class StackedIPABlocks(nn.Module):
 
 
 class TernaryDenoiseBlock(nn.Module):
-    def __init__(self, ipa_conf, num_classes=25):
+    def __init__(
+        self,
+        ipa_conf,
+        num_classes=25,
+        num_bond_classes=6,
+        unified_egnn_conf=None,
+        translation_scale=50.0,
+    ):
         super().__init__()
         self._ipa_conf = ipa_conf 
-        
         self.feat_dim = self._ipa_conf.c_s
 
-        # Ternary Denoise Block components according to Algorithm 2
-        
-        # NOTE: original single-step IPA blocks (kept for reference)
-        # # Shared IPA module for feature processing
-        # self.ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
-        # self.ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
-        #
-        # self.lig_ipa = InvariantPointAttention(self._ipa_conf)  # Shared for both entities
-        # self.lig_ipa_ln = nn.LayerNorm(self._ipa_conf.c_s)
-
-        # Shared stacked IPA module for feature & rigid processing (GA-style blocks)
-        num_stacked = getattr(self._ipa_conf, "num_blocks", 2)
-        self.stacked_ipa = StackedIPABlocks(self._ipa_conf, num_blocks=num_stacked)
-
-        self.phix = Phix(
+        unified_egnn_conf = unified_egnn_conf or {}
+        self.unified_egnn = UnifiedTernaryEGNN(
             c_s=self._ipa_conf.c_s,
             c_t=self._ipa_conf.c_s,
-            hidden_dim=self._ipa_conf.c_s
+            hidden_dim=int(getattr(
+                unified_egnn_conf, "hidden_dim", self._ipa_conf.c_s
+            )),
+            num_layers=int(getattr(unified_egnn_conf, "num_layers", 4)),
+            num_nearest_neighbors=int(getattr(
+                unified_egnn_conf, "num_nearest_neighbors", 32
+            )),
+            message_dim=int(getattr(
+                unified_egnn_conf, "message_dim", 64
+            )),
+            coor_weights_clamp_value=float(getattr(
+                unified_egnn_conf, "coor_weights_clamp_value", 2.0
+            )),
+            coordinate_scale=float(getattr(
+                unified_egnn_conf, "coordinate_scale", 10.0
+            )),
+            cross_entity_neighbors=int(getattr(
+                unified_egnn_conf, "cross_entity_neighbors", 8
+            )),
+            num_bond_classes=num_bond_classes,
+            bond_edge_dim=int(getattr(
+                unified_egnn_conf, "bond_edge_dim", 8
+            )),
+            num_classes=num_classes,
         )
 
         self.phiRT = PhiRT(
-            c_s=self._ipa_conf.c_s,
+            c_s=int(getattr(
+                unified_egnn_conf, "hidden_dim", self._ipa_conf.c_s
+            )),
             c_t=self._ipa_conf.c_s,
-            hidden_dim=self._ipa_conf.c_s
+            hidden_dim=self._ipa_conf.c_s,
+            translation_scale=translation_scale,
+            force_neighbors=int(getattr(
+                unified_egnn_conf, "force_neighbors", 8
+            )),
+            force_num_heads=int(getattr(
+                unified_egnn_conf, "force_num_heads", 8
+            )),
         )
         
         # self.seq_embedder = nn.Embedding(len(MAP_ATOM_TYPE_FULL_TO_INDEX), self._ipa_conf.c_s)
@@ -1642,102 +2362,98 @@ class TernaryDenoiseBlock(nn.Module):
 
         return timestep_emb
 
-    def forward(self, s1, s2, z1, z2, T1, T2, 
-                s_l, z_l, Tl,
-                seq_tilde, X_tilde, R_tilde, t_tilde, t, 
+    def forward(self, s1, s2, s_l,
+                seq_tilde, X_tilde, R_tilde, t_tilde, t,
                 p1, p2, 
                 mol_mask,
-                p2_coords_moved,
+                bond_tilde,
+                p2_coords_input,
                 sigma_1, sigma_2,
                 R_star, t_star,
                 Y1, Y2
             ):
-        """
-        Ternary Denoise Block forward pass according to Algorithm 2
-        
-        Args:
-            s1, s2: Single features for two proteins
-            z1, z2: Pair features for the two proteins  
-            I1, I2: Interface representations for the two proteins
-            T1, T2: Residue frames for the two proteins
-            seq_tilde: Noised molecular glue sequence at timestep t
-            X_tilde: Noised molecular glue coordinates at timestep t, (B, N, 3)
-            R_tilde: Noised rotation matrix at timestep t, (B, 3, 3)
-            t_tilde: Noised translation vector at timestep t, (B, 3)
-            t: Current timestep
-        """
+        """Coupled ligand/pose denoising from one ternary EGNN state."""
         p1_mask = p1['res_mask']
         p2_mask = p2['res_mask']
         p1_coords = p1['pos_heavyatom'][:, :, BBHeavyAtom.CA]
-        # p2_coords = p2['pos_heavyatom'][:, :, BBHeavyAtom.CA]
 
-        # NOTE: original single-step IPA usage (kept for reference)
-        # # Obtain the single representation of the two proteins and the molecular glue with IPA block.
-        # s1_tilde = self.ipa(s=s1, z=z1, r=T1, mask=p1_mask, i_repr=None) # (B, N1, c_s)
-        # s1_tilde = self.ipa_ln(s1_tilde)
-        #
-        # s2_tilde = self.ipa(s=s2, z=z2, r=T2, mask=p2_mask, i_repr=None) # (B, N2, c_s)
-        # s2_tilde = self.ipa_ln(s2_tilde)
-        #
-        # s_l_tilde = self.lig_ipa(s=s_l, z=z_l, r=Tl, mask=mol_mask, i_repr=None) # (B, N_l, c_s)
-        # s_l_tilde = self.lig_ipa_ln(s_l_tilde)
+        # All components must be expressed in one current coordinate frame
+        # before joint EGNN message passing.
+        R_current, t_current = PhiRT._remove_singleton_rigid_axis(
+            R_tilde, t_tilde
+        )
+        p2_coords_current = (
+            p2_coords_input @ R_current.transpose(1, 2)
+            + t_current.unsqueeze(1)
+        )
 
-        # Obtain updated single representations (and optionally pair/rigids) with stacked IPA blocks.
-        s1_tilde, _, _ = self.stacked_ipa(node_embed=s1, edge_embed=z1, rigids=T1, node_mask=p1_mask)
-        s2_tilde, _, _ = self.stacked_ipa(node_embed=s2, edge_embed=z2, rigids=T2, node_mask=p2_mask)
-        s_l_tilde, _, _ = self.stacked_ipa(node_embed=s_l, edge_embed=z_l, rigids=Tl, node_mask=mol_mask)
-        
-        # Compute pairwise coordinate differences between molecular glue atoms
-        B, N, _ = X_tilde.shape
-        X_i = X_tilde.unsqueeze(2)  # [B, N, 1, 3]
-        X_j = X_tilde.unsqueeze(1)  # [B, 1, N, 3]
-        coord_diffs = X_i - X_j     # [B, N, N, 3]
-
-        #########################################################
-        # Molecular glue coordinate prediction.
-        #########################################################
-        # Create combined mask: mask out self-interactions and padding atoms
-        self_mask = torch.eye(N, device=X_tilde.device, dtype=torch.bool).unsqueeze(0).unsqueeze(-1)  # [1, N, N, 1]
-        mol_mask_2d = mol_mask.unsqueeze(2) & mol_mask.unsqueeze(1)  # [B, N, N] - valid pairs
-        combined_mask = self_mask | ~mol_mask_2d.unsqueeze(-1)  # [B, N, N, 1]
-        
-        # Mask out invalid coord_diffs (apply to all 3 dimensions)
-        coord_diffs = coord_diffs * (~combined_mask).float()  # [B, N, N, 3]
-
-        # Time embedding
         t_emb = self.embed_t(t, mol_mask)  # [B, N, c_t]
+        (
+            X_pred,
+            seq_pred,
+            bond_pred,
+            s1_joint,
+            s2_joint,
+            s_l_joint,
+            p1_coords_joint,
+            p2_coords_joint,
+        ) = self.unified_egnn(
+            s1=s1,
+            p1_coords=p1_coords,
+            s2=s2,
+            p2_coords_current=p2_coords_current,
+            sl=s_l,
+            ligand_coords=X_tilde,
+            t_emb=t_emb,
+            p1_mask=p1_mask,
+            p2_mask=p2_mask,
+            mol_mask=mol_mask,
+            lig_bond_t=bond_tilde,
+        )
 
-        #########################################################
-        # Molecular glue sequence and coordinate prediction.
-        #########################################################
+        # RT is predicted only after the shared EGNN update.  It sees the same
+        # coupled features/coordinates as the atom and ligand-coordinate heads,
+        # together with the pretrained interface geometry.
+        R_pred, t_pred, rot_vf, trans_vf = self.phiRT(
+            Y1=Y1,
+            Y2=Y2,
+            R_star=R_star,
+            t_star=t_star,
+            R_tilde=R_tilde,
+            t_tilde=t_tilde,
+            t=t,
+            t_emb=t_emb,
+            s1=s1_joint,
+            s2=s2_joint,
+            s_l=s_l_joint,
+            p1_mask=p1_mask,
+            p2_mask=p2_mask,
+            mol_mask=mol_mask,
+            p1_coords=p1_coords_joint,
+            p2_coords=p2_coords_input,
+            p2_coords_current=p2_coords_joint,
+            lig_coords=X_pred,
+            sigma_1=sigma_1,
+            sigma_2=sigma_2,
+        )
 
-        #########################################################
-        # Translation vector and rotation matrix prediction to move the protein 2 to the final ternary complex.
-        #########################################################
-        R_pred, t_pred = self.phiRT(Y1, Y2, s1_tilde, p1_coords, s2_tilde, p2_coords_moved, R_star, t_star, R_tilde, t_tilde, t_emb, p1_mask, p2_mask, sigma_1, sigma_2)
-        
-        p2_coords_moved = p2_coords_moved @ R_pred.transpose(1, 2) + t_pred.unsqueeze(1) # Refine the coordinates of protein 2 to the final ternary complex.     
-        
-        # Compute updated coordinates via PhiX (with multi-layer coordinate updates)
-        # Get probability distributions from PhiA for each atom
-        X_pred, phi_a_probs = self.phix(s1_tilde, p1_coords, s2_tilde, p2_coords_moved, s_l_tilde, X_tilde, t_emb, p1_mask, p2_mask, mol_mask)
-        # Apply final mask
-        seq_pred = phi_a_probs * mol_mask.unsqueeze(-1)
-
-        return X_pred, seq_pred, R_pred, t_pred
+        return X_pred, seq_pred, bond_pred, R_pred, t_pred, rot_vf, trans_vf
 
 class VFModel(nn.Module):
-    def __init__(self, cfg, num_classes=25):
+    def __init__(self, cfg, num_classes=25, num_bond_classes=6,
+                 translation_scale=50.0):
         super().__init__()
         
         self.node_embedder = NodeEmbedder(cfg.node_embed_size, max_num_heavyatoms)
-        self.edge_embedder = EdgeEmbedder(cfg.edge_embed_size, max_num_heavyatoms)
-
         self.lig_node_embedder = LigandNodeEmbedder(cfg.node_embed_size, num_atom_types=len(MAP_ATOM_TYPE_FULL_TO_INDEX))
-        self.lig_edge_embedder = LigandEdgeEmbedder(cfg.edge_embed_size, num_distance_bins=32, distance_max=20.0)
         
-        # Initialize TernaryDenoiseBlock with IPA configuration
-        self.ternary_denoise_block = TernaryDenoiseBlock(cfg.ipa, num_classes=num_classes)
+        self.ternary_denoise_block = TernaryDenoiseBlock(
+            cfg.ipa,
+            num_classes=num_classes,
+            num_bond_classes=num_bond_classes,
+            unified_egnn_conf=getattr(cfg, "unified_egnn", None),
+            translation_scale=translation_scale,
+        )
 
     def encode(self, p1, p2, lig_coords_t, lig_seq_t, mol_mask):
         """
@@ -1754,40 +2470,11 @@ class VFModel(nn.Module):
             lig_seq_t: noised molecular glue sequence (B, N)
             mol_mask: molecular glue mask (B, N)
         Returns:
-            s1, s2: protein 1 and 2 features (B, N, c_s)
-            z1, z2: protein 1 and 2 pair features (B, N, N, c_z)
-            T1, T2: protein 1 and 2 rigid transformations (B, N, 3, 3)
-            s_l: ligand features (B, N, c_s)
-            z_l: ligand pair features (B, N, N, c_z)
+            Initial protein 1, protein 2 and ligand node features.  Pair
+            encoders are intentionally omitted: cross-component geometry is
+            represented by the shared EGNN rather than three independent IPA
+            streams.
         """
-        # Construct rigid transformations for both proteins
-        rotmats_p1 = construct_3d_basis(
-            p1['pos_heavyatom'][:, :, BBHeavyAtom.CA],
-            p1['pos_heavyatom'][:, :, BBHeavyAtom.C], 
-            p1['pos_heavyatom'][:, :, BBHeavyAtom.N]
-        )
-        rotmats_p2 = construct_3d_basis(
-            p2['pos_heavyatom'][:, :, BBHeavyAtom.CA],
-            p2['pos_heavyatom'][:, :, BBHeavyAtom.C],
-            p2['pos_heavyatom'][:, :, BBHeavyAtom.N]
-        )
-        trans_p1 = p1['pos_heavyatom'][:, :, BBHeavyAtom.CA]
-        trans_p2 = p2['pos_heavyatom'][:, :, BBHeavyAtom.CA]
-        
-        # Create rigid objects for both proteins
-        T1 = create_rigid(rotmats_p1, trans_p1)
-        T2 = create_rigid(rotmats_p2, trans_p2)
-        
-        # Create rigid object for ligand
-        # Since ligand only has coordinates (no basis atoms), we use identity rotation
-        # and the coordinates themselves as translation
-        B, N_l = lig_coords_t.shape[:2]
-        
-        # Create identity rotation matrices for each ligand atom: (B, N_l, 3, 3)
-        rotmats_l = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(B, N_l, 3, 3).to(lig_coords_t)
-        trans_l = lig_coords_t  # (B, N_l, 3)
-        Tl = create_rigid(rotmats_l, trans_l)
-        
         # Encode node features (single representations)
         s1 = self.node_embedder(
             p1['aa'],
@@ -1804,29 +2491,14 @@ class VFModel(nn.Module):
             p2['mask_heavyatom'],
         )  # (B, N2, c_s)
         
-        # Encode edge features (pair representations)  
-        z1 = self.edge_embedder(
-            p1['aa'],
-            p1['res_nb'],
-            p1['chain_nb'],
-            p1['pos_heavyatom'],
-            p1['mask_heavyatom'],
-        )  # (B, N1, N1, c_z)
-        z2 = self.edge_embedder(
-            p2['aa'],
-            p2['res_nb'],
-            p2['chain_nb'],
-            p2['pos_heavyatom'],
-            p2['mask_heavyatom'],
-        )  # (B, N2, N2, c_z)
-
         s_l = self.lig_node_embedder(lig_seq_t, mol_mask)
-        z_l = self.lig_edge_embedder(lig_coords_t, mol_mask)
-        
-        return s1, s2, s_l, z1, z2, z_l, T1, T2, Tl
+
+        return s1, s2, s_l
         
 
-    def forward(self, p1, p2, t, lig_coords_t, rotmats_t, trans_t, lig_seq_t, mol_mask, p2_coords_moved, sigma_1, sigma_2, R_star, t_star, Y1, Y2):
+    def forward(self, p1, p2, t, lig_coords_t, rotmats_t, trans_t,
+                lig_seq_t, lig_bond_t, mol_mask, p2_coords_input, sigma_1,
+                sigma_2, R_star, t_star, Y1, Y2):
         """
         Forward pass using TernaryDenoiseBlock
         
@@ -1843,17 +2515,36 @@ class VFModel(nn.Module):
         Returns:
             Tuple of predictions: (seq_pred, coords_pred, rot_pred, trans_pred)
         """
-        s1, s2, s_l, z1, z2, z_l, T1, T2, Tl = self.encode(p1, p2, lig_coords_t, lig_seq_t, mol_mask)
+        s1, s2, s_l = self.encode(
+            p1, p2, lig_coords_t, lig_seq_t, mol_mask
+        )
         
         # Use TernaryDenoiseBlock for denoising
-        coords_pred, seq_pred, rot_pred, trans_pred = self.ternary_denoise_block(
-            s1=s1, s2=s2, s_l=s_l, z1=z1, z2=z2, z_l=z_l, T1=T1, T2=T2, Tl=Tl,
-            seq_tilde=lig_seq_t, X_tilde=lig_coords_t, R_tilde=rotmats_t, t_tilde=trans_t, t=t,
+        (
+            coords_pred,
+            seq_pred,
+            bond_pred,
+            rot_pred,
+            trans_pred,
+            rot_vf,
+            trans_vf,
+        ) = self.ternary_denoise_block(
+            s1=s1, s2=s2, s_l=s_l,
+            seq_tilde=lig_seq_t, bond_tilde=lig_bond_t,
+            X_tilde=lig_coords_t, R_tilde=rotmats_t, t_tilde=trans_t, t=t,
             mol_mask=mol_mask, p1=p1, p2=p2,
-            p2_coords_moved=p2_coords_moved,
+            p2_coords_input=p2_coords_input,
             sigma_1=sigma_1, sigma_2=sigma_2,
             R_star=R_star, t_star=t_star,
             Y1=Y1, Y2=Y2
         )
         
-        return seq_pred, coords_pred, rot_pred, trans_pred
+        return (
+            seq_pred,
+            bond_pred,
+            coords_pred,
+            rot_pred,
+            trans_pred,
+            rot_vf,
+            trans_vf,
+        )

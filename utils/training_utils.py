@@ -32,6 +32,19 @@ _INDEX_TO_ATOMIC_NUM = {
     idx: atom_desc[0] for atom_desc, idx in MAP_ATOM_TYPE_FULL_TO_INDEX.items()
 }
 
+
+def move_to_device(value, device):
+    """Recursively move tensors in a nested batch to ``device``."""
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    return value
+
 def _pad_last(x, n, value=0):
     """Pad tensor or array to length n along the first dimension"""
     if isinstance(x, torch.Tensor):
@@ -85,7 +98,10 @@ def collate_fn(batch, eight=True):
             - 'p2': dict with 'aa' (L2,) and other fields
             - 'lig_seq': (L3,) array of atom types
             - 'lig_coords': (L3, 3) array of ligand coordinates
-            - 'lig_coords_gt': (L3, 3) array of ground truth ligand coordinates
+            - 'lig_bond_index': (2, E) directed chemical-bond indices (optional
+              for backward compatibility with datasets built before bonds)
+            - 'lig_bond_type': (E,) bond ids: 1=single, 2=double, 3=triple,
+              4=aromatic, 5=other; 0 is reserved for no bond/padding
             - 'R_inv': (3, 3) rotation matrix
             - 't_inv': (3,) translation vector
             - 'interface_flag': bool
@@ -262,6 +278,58 @@ def collate_fn(batch, eight=True):
     batched['lig_coords'] = torch.stack(lig_coords_list)
     # batched['lig_coords_gt'] = torch.stack(lig_coords_gt_list)
     batched['mol_mask'] = torch.stack(mol_mask_list)
+
+    # Convert the variable-size sparse ligand graph into a dense padded bond
+    # matrix. This is directly usable as an EGNN edge feature after embedding.
+    # Old datasets without bond fields remain loadable and produce all-zero
+    # matrices, with lig_bond_available=False making that state explicit.
+    lig_bond_type_matrix = torch.zeros(
+        (len(batch), max_lig_len, max_lig_len), dtype=torch.long
+    )
+    lig_bond_available = torch.zeros(len(batch), dtype=torch.bool)
+    for i, item in enumerate(batch):
+        has_index = 'lig_bond_index' in item
+        has_type = 'lig_bond_type' in item
+        if has_index != has_type:
+            raise ValueError(
+                f"Sample {item.get('name', i)!r} has only one of "
+                "lig_bond_index and lig_bond_type."
+            )
+        if not has_index:
+            continue
+
+        edge_index = torch.as_tensor(item['lig_bond_index'], dtype=torch.long)
+        edge_type = torch.as_tensor(item['lig_bond_type'], dtype=torch.long)
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise ValueError(
+                f"Sample {item.get('name', i)!r} has invalid lig_bond_index "
+                f"shape {tuple(edge_index.shape)}; expected (2, E)."
+            )
+        if edge_type.ndim != 1 or edge_type.shape[0] != edge_index.shape[1]:
+            raise ValueError(
+                f"Sample {item.get('name', i)!r} has incompatible bond "
+                f"shapes: index={tuple(edge_index.shape)}, "
+                f"type={tuple(edge_type.shape)}."
+            )
+        if edge_index.numel() > 0:
+            if edge_index.min().item() < 0 or edge_index.max().item() >= lig_lengths[i]:
+                raise ValueError(
+                    f"Sample {item.get('name', i)!r} contains a ligand bond "
+                    f"index outside [0, {lig_lengths[i]})."
+                )
+            if edge_type.min().item() < 1 or edge_type.max().item() > 5:
+                raise ValueError(
+                    f"Sample {item.get('name', i)!r} contains a ligand bond "
+                    "type outside the supported range [1, 5]."
+                )
+            lig_bond_type_matrix[
+                i, edge_index[0], edge_index[1]
+            ] = edge_type
+        lig_bond_available[i] = True
+
+    batched['lig_bond_type_matrix'] = lig_bond_type_matrix
+    batched['lig_bond_mask'] = lig_bond_type_matrix.ne(0)
+    batched['lig_bond_available'] = lig_bond_available
     
     # Handle R_inv and t_inv
     batched['R_inv'] = torch.stack([torch.tensor(item['R_inv'], dtype=torch.float32) if not isinstance(item['R_inv'], torch.Tensor) else item['R_inv'].float() for item in batch])
@@ -276,6 +344,9 @@ def collate_fn(batch, eight=True):
     # Add ground truth data for loss calculation (detach to save memory)
     batched['lig_seq_1'] = batched['lig_seq'].detach().clone()
     batched['lig_coords_1'] = batched['lig_coords'].detach().clone()
+    batched['lig_bond_type_matrix_1'] = (
+        batched['lig_bond_type_matrix'].detach().clone()
+    )
     batched['R_inv_1'] = batched['R_inv'].detach().clone()
     batched['t_inv_1'] = batched['t_inv'].detach().clone()
     
@@ -473,7 +544,10 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Checkpoints store the unwrapped module state, while resumed multi-GPU
+    # training passes a DistributedDataParallel wrapper here.
+    model_to_load = model.module if isinstance(model, DDP) else model
+    model_to_load.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -481,6 +555,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
     result = {
         'epoch': checkpoint.get('epoch', 0),
         'global_step': checkpoint.get('global_step', 0),
+        'loss_dict': checkpoint.get('loss_dict'),
     }
     
     # Return scaler state if available
@@ -494,16 +569,19 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
 
 def create_optimizer(model, config):
     """Create optimizer based on config"""
+    # Exclude frozen interface-encoder tensors. This also makes optimizer
+    # checkpoints smaller when only the virtual-keypoint heads are fine-tuned.
+    trainable_parameters = [param for param in model.parameters() if param.requires_grad]
     if config.optimizer.type == 'adam':
         optimizer = torch.optim.Adam(
-            model.parameters(),
+            trainable_parameters,
             lr=config.optimizer.lr,
             weight_decay=config.optimizer.weight_decay,
             betas=(config.optimizer.beta1, config.optimizer.beta2)
         )
     elif config.optimizer.type == 'adamw':
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_parameters,
             lr=config.optimizer.lr,
             weight_decay=config.optimizer.weight_decay
         )
@@ -611,10 +689,7 @@ def validate_original(model, val_dataset, device, config, is_main_process=True, 
                 batch_items = [item] * num_trajectories_per_sample
                 batch = collate_fn(batch_items)
 
-                # Move batch to device
-                for key in batch:
-                    if isinstance(batch[key], torch.Tensor):
-                        batch[key] = batch[key].to(device)
+                batch = move_to_device(batch, device)
 
                 # Sample from model (use actual_model to handle DDP wrapping)
                 traj = actual_model.sample(batch)
@@ -797,10 +872,7 @@ def validate(model, val_dataset, device, config, is_main_process=True, is_ddp=Fa
                 batch_items = [item] * num_trajectories_per_sample
                 batch = collate_fn(batch_items)
 
-                # Move batch to device
-                for key in batch:
-                    if isinstance(batch[key], torch.Tensor):
-                        batch[key] = batch[key].to(device)
+                batch = move_to_device(batch, device)
 
                 # Sample from model (use actual_model to handle DDP wrapping)
                 traj = actual_model.sample(batch)
@@ -976,7 +1048,13 @@ def get_dataloaders_and_sampler(config, world_size, rank, is_main_process):
     # Split dataset into train and validation
     train_size = int(config.dataset.train_split * len(dataset))
     val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    # Every DDP rank must construct the exact same Subset indices. The model
+    # noise seed may be rank-specific, but the dataset split must not be.
+    split_generator = torch.Generator().manual_seed(int(config.train.seed))
+    train_ds, val_ds = random_split(
+        dataset, [train_size, val_size], generator=split_generator
+    )
+
     
     # Create DistributedSampler if using multiple GPUs
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
@@ -1010,12 +1088,15 @@ def build_model_system(config, device, local_rank, world_size, is_main_process):
         'node_embed_size': config.model.encoder.node_embed_size,
         'edge_embed_size': config.model.encoder.edge_embed_size,
         'ipa': config.model.encoder.ipa,
+        'unified_egnn': getattr(config.model.encoder, 'unified_egnn', None),
         'interface_model': DictToObject({
             'path': getattr(config.model.interface_model, 'path', None),
             'trainable': getattr(config.model.interface_model, 'trainable', False),
+            'finetune_heads_only': getattr(config.model.interface_model, 'finetune_heads_only', True),
             'feat_dim': config.model.interface_model.feat_dim,
             'depth': getattr(config.model.interface_model, 'depth', 4),
             'num_nearest_neighbors': getattr(config.model.interface_model, 'num_nearest_neighbors', 16),
+            'num_att_heads': getattr(config.model.interface_model, 'num_att_heads', 50),
             'topk_k': getattr(config.model.interface_model, 'topk_k', 50),
         })
     })
@@ -1050,7 +1131,9 @@ def build_model_system(config, device, local_rank, world_size, is_main_process):
             model, 
             device_ids=[local_rank], 
             output_device=local_rank, 
-            find_unused_parameters=True
+            # The unified EGNN, atom head and RT head all participate in every
+            # training forward; unused-parameter traversal is unnecessary.
+            find_unused_parameters=False
         )
         
     optimizer = create_optimizer(model, config.train)
@@ -1067,8 +1150,14 @@ def log_metrics(epoch, global_step, train_metrics, val_metrics, optimizer, is_ma
         'epoch': epoch + 1,
         'global_step': global_step,
         'train/lr': optimizer.param_groups[0]['lr'],
-        # Unpack training metrics (remove 'avg_' prefix for cleaner keys)
-        **{f'train/{k.replace("avg_", "")}': v for k, v in train_metrics.items()}
+        # Unpack raw/total training metrics, but do not duplicate every loss
+        # with its weighted counterpart on WandB. Weighted metrics remain in
+        # train_metrics for console display and checkpoint diagnostics.
+        **{
+            f'train/{k.removeprefix("avg_")}': v
+            for k, v in train_metrics.items()
+            if not k.removeprefix("avg_").startswith("weighted_")
+        },
     }
     
     if val_metrics:

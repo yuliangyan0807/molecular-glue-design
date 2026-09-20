@@ -19,6 +19,19 @@ from utils.constants import (AA, max_num_heavyatoms, max_num_hydrogens,
                         BBHeavyAtom)
 import utils.constants as constants
 
+
+# Stable ligand-bond vocabulary used by the serialized flow-matching dataset.
+# Keep 0 for "no bond" so a dense [num_atoms, num_atoms] matrix can be padded
+# with zeros without introducing artificial bonds.
+LIGAND_BOND_TYPE_TO_ID = {
+    BondType.SINGLE: 1,
+    BondType.DOUBLE: 2,
+    BondType.TRIPLE: 3,
+    BondType.AROMATIC: 4,
+}
+LIGAND_OTHER_BOND_TYPE_ID = 5
+NUM_LIGAND_BOND_TYPES = 6  # no bond + 4 common types + other
+
 def normalize_vector(v, dim, eps=1e-6):
     return v / (torch.linalg.norm(v, ord=2, dim=dim, keepdim=True) + eps)
 
@@ -334,12 +347,14 @@ def parse_pdb_ligand(path, heavy_only=True, mode='full'):
     pos = np.array(pos, dtype=np.float32)
 
     row, col, edge_type = [], [], []
-    BOND_TYPES = {t: i for i, t in enumerate(BondType.names.values())}
     for bond in mol.GetBonds():
         start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bond_type_id = LIGAND_BOND_TYPE_TO_ID.get(
+            bond.GetBondType(), LIGAND_OTHER_BOND_TYPE_ID
+        )
         row += [start, end]
         col += [end, start]
-        edge_type += 2 * [BOND_TYPES[bond.GetBondType()]]
+        edge_type += 2 * [bond_type_id]
     edge_index = np.array([row, col], dtype=np.int32)
     edge_type = np.array(edge_type, dtype=np.int32)
     perm = (edge_index[0] * num_atoms + edge_index[1]).argsort()
@@ -597,40 +612,45 @@ def kabsch_align(Y1, Y2, mask=None):
         Y2_aligned: (B, K, 3)
     """
 
-    B, K, _ = Y1.shape
+    # CUDA SVD is not implemented for FP16, and Kabsch is numerically sensitive.
+    # Keep this small 3x3 solve in FP32 while the rest of the model uses AMP.
+    with torch.autocast(device_type=Y1.device.type, enabled=False):
+        Y1 = Y1.float()
+        Y2 = Y2.float()
+        B, K, _ = Y1.shape
 
-    if mask is not None:
-        mask = mask.unsqueeze(-1)  # (B, K, 1)
-        Y1_mean = (Y1 * mask).sum(dim=1) / mask.sum(dim=1)
-        Y2_mean = (Y2 * mask).sum(dim=1) / mask.sum(dim=1)
-    else:
-        Y1_mean = Y1.mean(dim=1)
-        Y2_mean = Y2.mean(dim=1)
+        if mask is not None:
+            mask = mask.unsqueeze(-1).float()  # (B, K, 1)
+            Y1_mean = (Y1 * mask).sum(dim=1) / mask.sum(dim=1)
+            Y2_mean = (Y2 * mask).sum(dim=1) / mask.sum(dim=1)
+        else:
+            Y1_mean = Y1.mean(dim=1)
+            Y2_mean = Y2.mean(dim=1)
 
-    # Center
-    Y1_c = Y1 - Y1_mean.unsqueeze(1)
-    Y2_c = Y2 - Y2_mean.unsqueeze(1)
+        # Center
+        Y1_c = Y1 - Y1_mean.unsqueeze(1)
+        Y2_c = Y2 - Y2_mean.unsqueeze(1)
 
-    if mask is not None:
-        Y1_c = Y1_c * mask
-        Y2_c = Y2_c * mask
+        if mask is not None:
+            Y1_c = Y1_c * mask
+            Y2_c = Y2_c * mask
 
-    # Covariance: source^T @ target
-    A = torch.matmul(Y2_c.transpose(1, 2), Y1_c)  # (B,3,3)
+        # Covariance: source^T @ target
+        A = torch.matmul(Y2_c.transpose(1, 2), Y1_c)  # (B,3,3)
 
-    # Batch SVD
-    U, S, Vt = torch.linalg.svd(A)
+        # Batch SVD
+        U, S, Vt = torch.linalg.svd(A)
 
-    # Reflection correction
-    det = torch.det(torch.matmul(Vt.transpose(1,2), U.transpose(1,2)))
-    corr = torch.eye(3, device=Y1.device).unsqueeze(0).repeat(B,1,1)
-    corr[:, -1, -1] = det
+        # Reflection correction
+        det = torch.det(torch.matmul(Vt.transpose(1,2), U.transpose(1,2)))
+        corr = torch.eye(3, device=Y1.device).unsqueeze(0).repeat(B,1,1)
+        corr[:, -1, -1] = det
 
-    # Rotation
-    R = torch.matmul(torch.matmul(Vt.transpose(1,2), corr), U.transpose(1,2))
+        # Rotation
+        R = torch.matmul(torch.matmul(Vt.transpose(1,2), corr), U.transpose(1,2))
 
-    # Translation
-    t = Y1_mean - torch.matmul(R, Y2_mean.unsqueeze(-1)).squeeze(-1)
+        # Translation
+        t = Y1_mean - torch.matmul(R, Y2_mean.unsqueeze(-1)).squeeze(-1)
 
     # Apply transform
     # Y2_aligned = torch.matmul(Y2, R.transpose(1,2)) + t.unsqueeze(1)

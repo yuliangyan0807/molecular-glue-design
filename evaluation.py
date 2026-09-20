@@ -24,7 +24,6 @@ from utils.training_utils import (
     compute_rmsd,
     compute_translation_error,
     compute_rotation_error,
-    compute_sequence_accuracy,
     load_config_from_yaml,
     merge_pdbs,
     set_new_coords,
@@ -44,9 +43,6 @@ from biopandas.pdb import PandasPdb
 
 
 INDEX_TO_ATOMIC_NUM = {idx: atom_desc[0] for atom_desc, idx in MAP_ATOM_TYPE_FULL_TO_INDEX.items()}
-PXM_ATOMIC_NUMBERS = [6, 7, 8, 9, 15, 16, 17, 5, 35, 53, 34]
-
-
 def decode_lig_seq_to_atomic_nums(lig_seq, mol_mask):
     """Decode valid ligand atom type indices to atomic numbers."""
     valid_seq = lig_seq[mol_mask].detach().cpu().numpy().astype(np.int64)
@@ -71,6 +67,9 @@ def parse_args():
     parser.add_argument('--trajectory_batch_size', type=int, default=None,
                        help='Max trajectories per model.sample() call (GPU micro-batch). '
                             'None means one batch of size num_trajectories_per_sample (legacy behavior).')
+    parser.add_argument('--num_sampling_steps', type=int, default=None,
+                       help='Override the sampling/ODE steps from the YAML config. '
+                            'None uses model.interpolant.sampling.num_timesteps.')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--save_predictions', action='store_true', 
                        help='Save individual predictions to files')
@@ -82,6 +81,15 @@ def parse_args():
                        help='Number of worker processes (default: number of GPUs)')
     parser.add_argument('--use_reconstruct', action='store_true',
                        help='Enable ligand reconstruction from predicted atom types and coordinates')
+    parser.add_argument(
+        '--interface_ablation',
+        choices=('none', 'no_pose_prior', 'no_virtual_interface', 'no_interface'),
+        default='none',
+        help=(
+            'Counterfactual PhiRT condition mask. The default keeps the full '
+            'model; other modes remove only the selected interface route.'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -100,6 +108,7 @@ def load_model_and_config(args):
         'interface_model': DictToObject({
             'path': getattr(config.model.interface_model, 'path', None),
             'trainable': getattr(config.model.interface_model, 'trainable', False),
+            'finetune_heads_only': getattr(config.model.interface_model, 'finetune_heads_only', True),
             'feat_dim': config.model.interface_model.feat_dim,
             'depth': getattr(config.model.interface_model, 'depth', 4),
             'num_nearest_neighbors': getattr(config.model.interface_model, 'num_nearest_neighbors', 16),
@@ -116,6 +125,12 @@ def load_model_and_config(args):
             sampling_config = DictToObject({'num_steps': getattr(sampling_config, 'num_steps', 100)})
     else:
         sampling_config = DictToObject({'num_steps': 100})
+
+    num_sampling_steps = getattr(args, 'num_sampling_steps', None)
+    if num_sampling_steps is not None:
+        if num_sampling_steps < 2:
+            raise ValueError('--num_sampling_steps must be at least 2')
+        sampling_config.num_steps = int(num_sampling_steps)
     
     full_config = DictToObject({
         'model': model_config,
@@ -137,11 +152,34 @@ def load_model_and_config(args):
     
     # Handle different checkpoint formats
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model_state = checkpoint['model_state_dict']
     elif 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
+        model_state = checkpoint['model']
     else:
-        model.load_state_dict(checkpoint)
+        model_state = checkpoint
+
+    # Class-balanced CE added this deterministic, non-trainable buffer after
+    # some otherwise architecture-compatible checkpoints had finished
+    # training. Preserve strict loading for every learned tensor while allowing
+    # those checkpoints to use the weights configured by the current dataset.
+    if (
+        'atom_class_weights' not in model_state
+        and hasattr(model, 'atom_class_weights')
+    ):
+        model_state = dict(model_state)
+        model_state['atom_class_weights'] = model.atom_class_weights
+        if verbose:
+            print(
+                'Checkpoint has no atom_class_weights buffer; using the '
+                'current configured class weights.'
+            )
+    model.load_state_dict(model_state)
+    interface_ablation = getattr(args, 'interface_ablation', 'none')
+    model.vf_model.ternary_denoise_block.phiRT.interface_ablation = (
+        interface_ablation
+    )
+    if verbose:
+        print(f"Interface ablation: {interface_ablation}")
     
     model.eval()
     if verbose:
@@ -227,6 +265,7 @@ def evaluate_sample(model, item, device, num_trajectories_per_sample=1, args=Non
 
                 lig_seq_pred = final_sample['lig_seq'][traj_idx]
                 lig_seq_gt = batch['lig_seq_1'][traj_idx]
+                lig_bond_pred = final_sample['lig_bond'][traj_idx]
 
                 rmsd = compute_rmsd(
                     lig_coords_pred.unsqueeze(0),
@@ -241,24 +280,25 @@ def evaluate_sample(model, item, device, num_trajectories_per_sample=1, args=Non
                     rot_pred.unsqueeze(0),
                     rot_gt.unsqueeze(0),
                 )
-                seq_acc = compute_sequence_accuracy(
-                    lig_seq_pred.unsqueeze(0),
-                    lig_seq_gt.unsqueeze(0),
-                    mol_mask.unsqueeze(0),
-                    align_to_pocketxmol=True,
-                    pocketxmol_atomic_numbers=PXM_ATOMIC_NUMBERS,
-                )
-
                 mol_mask_np = mol_mask.detach().cpu().numpy().astype(bool)
                 lig_seq_pred_np = lig_seq_pred.detach().cpu().numpy()
                 # Per-atom predicted type indices for valid ligand slots (same order as masked coords).
                 lig_seq_pred_atoms = lig_seq_pred_np[mol_mask_np].astype(np.int64)
+                lig_bond_pred_np = lig_bond_pred.detach().cpu().numpy()
+                lig_bond_pred_np = lig_bond_pred_np[np.ix_(mol_mask_np, mol_mask_np)]
+                # Save each undirected predicted bond once as [atom_i, atom_j, bond_type].
+                # This sparse representation is sufficient for later molecule reconstruction
+                # without making detailed_results.json dominated by padded L x L matrices.
+                bond_i, bond_j = np.where(np.triu(lig_bond_pred_np, k=1) > 0)
+                lig_bond_pred_edges = [
+                    [int(i), int(j), int(lig_bond_pred_np[i, j])]
+                    for i, j in zip(bond_i, bond_j)
+                ]
 
                 metric_dict = {
                     'rmsd': rmsd.item(),
                     'trans_error': trans_error.item(),
                     'rot_error': rot_error.item(),
-                    'seq_acc': seq_acc.item(),
                     'lig_coords_pred': lig_coords_pred.cpu().numpy(),
                     'lig_coords_gt': lig_coords_gt.cpu().numpy(),
                     'trans_pred': trans_pred.cpu().numpy(),
@@ -268,6 +308,7 @@ def evaluate_sample(model, item, device, num_trajectories_per_sample=1, args=Non
                     'lig_seq_pred': lig_seq_pred.cpu().numpy(),
                     'lig_seq_gt': lig_seq_gt.cpu().numpy(),
                     'lig_seq_pred_atoms': lig_seq_pred_atoms,
+                    'lig_bond_pred_edges': lig_bond_pred_edges,
                     'mol_mask': mol_mask.cpu().numpy(),
                 }
 
@@ -317,11 +358,45 @@ def evaluate_sample(model, item, device, num_trajectories_per_sample=1, args=Non
                 p1_mask_flat = p1_mask_traj.reshape(L1 * A)
                 p1_valid_coords = p1_coords_flat[p1_mask_flat]
 
+                if len(p1_pdb.df['ATOM']) != len(p1_valid_coords):
+                    if getattr(args, "log_worker_warnings", False):
+                        print(
+                            f"Warning: skipping DockQ for {name} trajectory {gi}: "
+                            f"P1 PDB atoms={len(p1_pdb.df['ATOM'])}, "
+                            f"dataset atoms={len(p1_valid_coords)}"
+                        )
+                    metric_dict.update({
+                        'fnat': -1.0,
+                        'irms': -1.0,
+                        'Lrms': -1.0,
+                        'dockq': -1.0,
+                        'dockq_error': 'p1_atom_count_mismatch',
+                    })
+                    trajectories_metrics.append(metric_dict)
+                    continue
+
                 p1_pdb.df['ATOM'][['x_coord', 'y_coord', 'z_coord']] = p1_valid_coords
 
                 p2_coords_flat = p2_restored.reshape(L2 * A, 3)
                 p2_mask_flat = p2_mask_traj.numpy().reshape(L2 * A)
                 p2_valid_coords = p2_coords_flat[p2_mask_flat]
+
+                if len(p2_pdb.df['ATOM']) != len(p2_valid_coords):
+                    if getattr(args, "log_worker_warnings", False):
+                        print(
+                            f"Warning: skipping DockQ for {name} trajectory {gi}: "
+                            f"P2 PDB atoms={len(p2_pdb.df['ATOM'])}, "
+                            f"dataset atoms={len(p2_valid_coords)}"
+                        )
+                    metric_dict.update({
+                        'fnat': -1.0,
+                        'irms': -1.0,
+                        'Lrms': -1.0,
+                        'dockq': -1.0,
+                        'dockq_error': 'p2_atom_count_mismatch',
+                    })
+                    trajectories_metrics.append(metric_dict)
+                    continue
 
                 p2_pdb.df['ATOM'][['x_coord', 'y_coord', 'z_coord']] = p2_valid_coords
 
@@ -367,8 +442,7 @@ def evaluate_sample(model, item, device, num_trajectories_per_sample=1, args=Non
 
 
 def _evaluate_subset(model, dataset, device, args, subset_indices, progress_queue=None, desc="Evaluating"):
-    all_rmsd, all_trans_error, all_rot_error, all_seq_acc = [], [], [], []
-    all_seq_acc_all_trajectories = []
+    all_rmsd, all_trans_error, all_rot_error = [], [], []
     all_fnat, all_irms, all_Lrms, all_dockq = [], [], [], []
     sample_results = []
 
@@ -385,10 +459,12 @@ def _evaluate_subset(model, dataset, device, args, subset_indices, progress_queu
             all_rmsd.append(best_metrics['rmsd'])
             all_trans_error.append(best_metrics['trans_error'])
             all_rot_error.append(best_metrics['rot_error'])
-            all_seq_acc.append(best_metrics['seq_acc'])
-            all_seq_acc_all_trajectories.extend([m['seq_acc'] for m in trajectories_metrics])
 
-            if 'dockq' in best_metrics:
+            # A negative DockQ is the explicit sentinel for an evaluation-side
+            # PDB/export failure, not a physical model score. Keep the ligand
+            # metrics for that sample but exclude the invalid DockQ tuple from
+            # aggregate docking statistics.
+            if best_metrics.get('dockq', -1.0) >= 0.0:
                 all_fnat.append(best_metrics['fnat'])
                 all_irms.append(best_metrics['irms'])
                 all_Lrms.append(best_metrics['Lrms'])
@@ -399,7 +475,6 @@ def _evaluate_subset(model, dataset, device, args, subset_indices, progress_queu
                 'name': item.get('name', f'sample_{idx}'),
                 'best_trajectory': best_metrics,
                 'num_trajectories': len(trajectories_metrics),
-                'all_trajectories_seq_acc': [m['seq_acc'] for m in trajectories_metrics],
                 'all_trajectories_lig_coords_pred': [m['lig_coords_pred'] for m in trajectories_metrics],
             }
 
@@ -408,17 +483,18 @@ def _evaluate_subset(model, dataset, device, args, subset_indices, progress_queu
                     'rmsd': np.mean([m['rmsd'] for m in trajectories_metrics]),
                     'trans_error': np.mean([m['trans_error'] for m in trajectories_metrics]),
                     'rot_error': np.mean([m['rot_error'] for m in trajectories_metrics]),
-                    'seq_acc': np.mean([m['seq_acc'] for m in trajectories_metrics]),
                 }
                 sample_result['std_metrics'] = {
                     'rmsd': np.std([m['rmsd'] for m in trajectories_metrics]),
                     'trans_error': np.std([m['trans_error'] for m in trajectories_metrics]),
                     'rot_error': np.std([m['rot_error'] for m in trajectories_metrics]),
-                    'seq_acc': np.std([m['seq_acc'] for m in trajectories_metrics]),
                 }
                 sample_result['all_trajectories_rmsd'] = [m['rmsd'] for m in trajectories_metrics]
                 sample_result['all_trajectories_lig_seq_pred_atoms'] = [
                     m['lig_seq_pred_atoms'] for m in trajectories_metrics
+                ]
+                sample_result['all_trajectories_lig_bond_pred_edges'] = [
+                    m['lig_bond_pred_edges'] for m in trajectories_metrics
                 ]
                 if 'dockq' in trajectories_metrics[0]:
                     sample_result['all_trajectories_dockq'] = [m['dockq'] for m in trajectories_metrics]
@@ -440,8 +516,6 @@ def _evaluate_subset(model, dataset, device, args, subset_indices, progress_queu
         'all_rmsd': all_rmsd,
         'all_trans_error': all_trans_error,
         'all_rot_error': all_rot_error,
-        'all_seq_acc': all_seq_acc,
-        'all_seq_acc_all_trajectories': all_seq_acc_all_trajectories,
         'all_fnat': all_fnat,
         'all_irms': all_irms,
         'all_Lrms': all_Lrms,
@@ -455,8 +529,6 @@ def _merge_partial_results(results_list):
         'all_rmsd': [],
         'all_trans_error': [],
         'all_rot_error': [],
-        'all_seq_acc': [],
-        'all_seq_acc_all_trajectories': [],
         'all_fnat': [],
         'all_irms': [],
         'all_Lrms': [],
@@ -467,8 +539,6 @@ def _merge_partial_results(results_list):
         merged['all_rmsd'].extend(result['all_rmsd'])
         merged['all_trans_error'].extend(result['all_trans_error'])
         merged['all_rot_error'].extend(result['all_rot_error'])
-        merged['all_seq_acc'].extend(result['all_seq_acc'])
-        merged['all_seq_acc_all_trajectories'].extend(result['all_seq_acc_all_trajectories'])
         merged['all_fnat'].extend(result['all_fnat'])
         merged['all_irms'].extend(result['all_irms'])
         merged['all_Lrms'].extend(result['all_Lrms'])
@@ -527,6 +597,10 @@ def evaluate_dataset_simple_multi_gpu(args):
 
     print(f"\n[Simple Multi-GPU] Evaluating {len(indices)} samples on GPUs: {gpu_ids}")
     print(f"[Simple Multi-GPU] Trajectories per sample: {args.num_trajectories_per_sample}")
+    print(
+        f"[Simple Multi-GPU] Sampling steps: "
+        f"{args.num_sampling_steps if args.num_sampling_steps is not None else 'from config'}"
+    )
     if getattr(args, 'trajectory_batch_size', None) is not None:
         print(f"[Simple Multi-GPU] Trajectory batch size (per forward): {args.trajectory_batch_size}")
 
@@ -538,7 +612,9 @@ def evaluate_dataset_simple_multi_gpu(args):
         'output_dir': args.output_dir,
         'num_trajectories_per_sample': args.num_trajectories_per_sample,
         'trajectory_batch_size': getattr(args, 'trajectory_batch_size', None),
+        'num_sampling_steps': getattr(args, 'num_sampling_steps', None),
         'use_reconstruct': getattr(args, 'use_reconstruct', False),
+        'interface_ablation': getattr(args, 'interface_ablation', 'none'),
         'seed': args.seed,
         'verbose': False,
         'log_worker_warnings': False,
@@ -572,8 +648,6 @@ def evaluate_dataset_simple_multi_gpu(args):
     all_rmsd = merged['all_rmsd']
     all_trans_error = merged['all_trans_error']
     all_rot_error = merged['all_rot_error']
-    all_seq_acc = merged['all_seq_acc']
-    all_seq_acc_all_trajectories = merged['all_seq_acc_all_trajectories']
     all_fnat = merged['all_fnat']
     all_irms = merged['all_irms']
     all_Lrms = merged['all_Lrms']
@@ -595,16 +669,6 @@ def evaluate_dataset_simple_multi_gpu(args):
             'mean': np.mean(all_rot_error) if all_rot_error else 0.0,
             'std': np.std(all_rot_error) if all_rot_error else 0.0,
             'median': np.median(all_rot_error) if all_rot_error else 0.0,
-        },
-        'seq_acc': {
-            'mean': np.mean(all_seq_acc) if all_seq_acc else 0.0,
-            'std': np.std(all_seq_acc) if all_seq_acc else 0.0,
-            'median': np.median(all_seq_acc) if all_seq_acc else 0.0,
-        },
-        'seq_acc_all_trajectories': {
-            'mean': np.mean(all_seq_acc_all_trajectories) if all_seq_acc_all_trajectories else 0.0,
-            'std': np.std(all_seq_acc_all_trajectories) if all_seq_acc_all_trajectories else 0.0,
-            'median': np.median(all_seq_acc_all_trajectories) if all_seq_acc_all_trajectories else 0.0,
         },
     }
     if all_dockq:
@@ -633,7 +697,13 @@ def save_results(results, output_dir, args):
         'num_dockq_computed': results.get('num_dockq_computed', 0),
         'num_trajectories_per_sample': args.num_trajectories_per_sample,
         'trajectory_batch_size': getattr(args, 'trajectory_batch_size', None),
+        'num_sampling_steps': getattr(args, 'num_sampling_steps', None),
+        'checkpoint': args.checkpoint,
+        'config': args.config,
+        'dataset_path': args.dataset_path,
+        'seed': args.seed,
         'use_reconstruct': getattr(args, 'use_reconstruct', False),
+        'interface_ablation': getattr(args, 'interface_ablation', 'none'),
         'timestamp': datetime.now().isoformat(),
     }
     
@@ -670,6 +740,10 @@ def save_results(results, output_dir, args):
     print("="*80)
     print(f"Number of samples evaluated: {results['num_evaluated']}")
     print(f"Trajectories per sample: {args.num_trajectories_per_sample}")
+    print(
+        f"Sampling steps: "
+        f"{args.num_sampling_steps if args.num_sampling_steps is not None else 'from config'}"
+    )
     print(f"Ligand reconstruct enabled: {getattr(args, 'use_reconstruct', False)}")
     if getattr(args, 'trajectory_batch_size', None) is not None:
         print(f"Trajectory batch size (per forward): {args.trajectory_batch_size}")
@@ -679,9 +753,6 @@ def save_results(results, output_dir, args):
     print(f"  RMSD: {results['overall_metrics']['rmsd']['mean']:.4f} ± {results['overall_metrics']['rmsd']['std']:.4f} Å")
     print(f"  Translation Error: {results['overall_metrics']['trans_error']['mean']:.4f} ± {results['overall_metrics']['trans_error']['std']:.4f} Å")
     print(f"  Rotation Error: {results['overall_metrics']['rot_error']['mean']:.4f} ± {results['overall_metrics']['rot_error']['std']:.4f}")
-    print(f"  Sequence Accuracy: {results['overall_metrics']['seq_acc']['mean']:.4f} ± {results['overall_metrics']['seq_acc']['std']:.4f} ({results['overall_metrics']['seq_acc']['mean']*100:.2f}%)")
-    print("\nOverall Metrics (All Trajectories):")
-    print(f"  Sequence Accuracy: {results['overall_metrics']['seq_acc_all_trajectories']['mean']:.4f} ± {results['overall_metrics']['seq_acc_all_trajectories']['std']:.4f} ({results['overall_metrics']['seq_acc_all_trajectories']['mean']*100:.2f}%)")
     
     if 'dockq' in results['overall_metrics']:
         print("\nDockQ Metrics:")

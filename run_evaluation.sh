@@ -4,27 +4,28 @@
 # Usage: bash run_evaluation.sh
 
 # Set paths (modify these according to your setup)
-CONFIG_PATH="configs/flow_matching_config.yaml"  # Path to config YAML file
-# CHECKPOINT_PATH="checkpoints/flow-model/0317latest.pt"  # Path to model checkpoint
-CHECKPOINT_PATH="checkpoints_0407/latest.pt"  # Path to model checkpoint
-DATASET_PATH="data/Moloctite/TernaryDataset_test"  # Path to dataset directory
-PDB_BASE_DIR="data/TernaryDB/MGD_test"  # Base directory containing PDB files
-OUTPUT_DIR="./evaluation_results"  # Output directory for results
+CONFIG_PATH="${CONFIG_PATH:-configs/flow_matching_config.yaml}"  # Path to config YAML file
+PYTHON_BIN="${PYTHON_BIN:-/home/yuliangyan/anaconda3/envs/mgd/bin/python}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints_20260831-224641/best.pt}"  # Path to model checkpoint
+DATASET_PATH="${DATASET_PATH:-data/Moloctite/TernaryDataset_test_bonds}"  # Bond-aware test dataset
+PDB_BASE_DIR="${PDB_BASE_DIR:-data/TernaryDB/MGD_test}"  # Base directory containing PDB files
+OUTPUT_DIR="${OUTPUT_DIR:-./evaluation_results_20260904_checkpoints20260831_224641_best_100traj_100steps_8gpu}"  # Result directory
 
 # Evaluation parameters
-DEVICE="cuda"  # Device to use: cuda or cpu
-GPU_IDS="0,1,2,3,4,5,6,7"  # Comma-separated GPU IDs (e.g., "0,1,2,3"). If empty, uses all available GPUs.
-NUM_SAMPLES=""  # Number of samples to evaluate (empty = all, or set to a number like "50")
-NUM_TRAJECTORIES_PER_SAMPLE=100  # Total trajectories per input sample
-TRAJECTORY_BATCH_SIZE=2        # Max trajectories per model.sample() (GPU micro-batch); empty = one batch of NUM_TRAJECTORIES_PER_SAMPLE
-SEED=42  # Random seed
+DEVICE="${DEVICE:-cuda}"  # Device to use: cuda or cpu
+GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"  # Comma-separated GPU IDs
+NUM_SAMPLES="${NUM_SAMPLES:-}"  # Number of samples to evaluate (empty = all)
+NUM_TRAJECTORIES_PER_SAMPLE="${NUM_TRAJECTORIES_PER_SAMPLE:-100}"
+TRAJECTORY_BATCH_SIZE="${TRAJECTORY_BATCH_SIZE:-32}"
+NUM_SAMPLING_STEPS="${NUM_SAMPLING_STEPS:-100}"
+SEED="${SEED:-42}"
 
 # Optional: Save individual predictions
 # SAVE_PREDICTIONS="--save_predictions"  # Uncomment to save predictions
 SAVE_PREDICTIONS=""
 
 # Build command
-CMD="python evaluation.py \
+CMD="${PYTHON_BIN} evaluation.py \
     --config \"${CONFIG_PATH}\" \
     --checkpoint \"${CHECKPOINT_PATH}\" \
     --dataset_path \"${DATASET_PATH}\" \
@@ -32,6 +33,7 @@ CMD="python evaluation.py \
     --output_dir \"${OUTPUT_DIR}\" \
     --device \"${DEVICE}\" \
     --num_trajectories_per_sample \"${NUM_TRAJECTORIES_PER_SAMPLE}\" \
+    --num_sampling_steps \"${NUM_SAMPLING_STEPS}\" \
     --seed \"${SEED}\""
 
 if [ -n "${TRAJECTORY_BATCH_SIZE}" ]; then
@@ -65,6 +67,7 @@ echo "  GPU IDs: ${GPU_IDS:-auto (all available)}"
 echo "  Num Samples: ${NUM_SAMPLES:-all}"
 echo "  Num Trajectories per Sample: ${NUM_TRAJECTORIES_PER_SAMPLE}"
 echo "  Trajectory Batch Size: ${TRAJECTORY_BATCH_SIZE:-all at once}"
+echo "  Sampling Steps: ${NUM_SAMPLING_STEPS}"
 echo "  Seed: ${SEED}"
 echo ""
 
@@ -78,4 +81,3 @@ else
     echo "✗ Evaluation failed!"
     exit 1
 fi
-

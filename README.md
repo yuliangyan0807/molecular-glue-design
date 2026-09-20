@@ -109,7 +109,7 @@ Then point `configs/flow_matching_config.yaml` → `model.interface_model.path` 
 
 Hyperparameters (from config):
 
-- `max_epochs: 800`, `batch_size: 4`, `lr: 5e-4` → `end_lr: 4e-4` (linear)
+- `max_epochs: 800`, `batch_size: 4`, AMP FP16 enabled, `lr: 5e-4` → `end_lr: 4e-4` (linear)
 - Loss weights: `trans=0.008`, `rot=1.0`, `seqs=1.0`, `coords=10.0`
 - Sampling steps: `num_timesteps: 50`
 - Checkpoint every 50 epochs + `latest.pt`; `best.pt` when val RMSD improves

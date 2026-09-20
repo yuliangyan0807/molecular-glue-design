@@ -106,6 +106,10 @@ def ellipsoid_loss(pred_i1, pred_i2, batch, use_kl=False, mu_scale=1.0, sigma_sc
 
         return mu_loss + sigma_loss
 
+    # FIXME(RT-DEBUG): moment matching is permutation-invariant over virtual
+    # keypoints, while downstream Kabsch assumes head-wise Y1[k] <-> Y2[k]
+    # correspondence. Add a pose/correspondence auxiliary loss before treating
+    # R_star/t_star as a fully supervised docking prior.
     loss1 = single_loss(pred_i1, batch['i1_mu'], batch['i1_sigma'])
     loss2 = single_loss(pred_i2, batch['i2_mu'], batch['i2_sigma'])
     # return 0.5 * (loss1 + loss2)

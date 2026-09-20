@@ -47,7 +47,7 @@ def get_ligand_atom_features(rdmol):
     hs = (node_type == 1).to(torch.float)
     num_hs = scatter(hs[row], col, dim_size=num_atoms).numpy()
     # need to change ATOM_FEATS accordingly
-    feat_mat = np.array([atomic_number, aromatic, degree, num_hs, hybrid], dtype=np.long).transpose()
+    feat_mat = np.array([atomic_number, aromatic, degree, num_hs, hybrid], dtype=np.int64).transpose()
     return feat_mat
 
 
@@ -76,7 +76,7 @@ def parse_sdf_file_text(path):
 
     center_of_mass = np.array(accum_pos / accum_mass, dtype=np.float32)
 
-    element = np.array(element, dtype=np.int)
+    element = np.array(element, dtype=np.int64)
     pos = np.array(pos, dtype=np.float32)
     BOND_TYPES = {t: i for i, t in enumerate(BondType.names.values())}
     bond_type_map = {
@@ -93,8 +93,8 @@ def parse_sdf_file_text(path):
         col += [end, start]
         edge_type += 2 * [bond_type_map[int(bond_line[6:9])]]
 
-    edge_index = np.array([row, col], dtype=np.long)
-    edge_type = np.array(edge_type, dtype=np.long)
+    edge_index = np.array([row, col], dtype=np.int64)
+    edge_type = np.array(edge_type, dtype=np.int64)
 
     perm = (edge_index[0] * num_atoms + edge_index[1]).argsort()
     edge_index = edge_index[:, perm]
@@ -185,7 +185,7 @@ def parse_sdf_file_mol(path, heavy_only=True, mol=None):
         accum_pos += np.array([x, y, z]) * atomic_weight
         accum_mass += atomic_weight
     center_of_mass = np.array(accum_pos / accum_mass, dtype=np.float32)
-    element = np.array(element, dtype=np.int)
+    element = np.array(element, dtype=np.int64)
     pos = np.array(pos, dtype=np.float32)
 
     row, col, edge_type = [], [], []
@@ -195,8 +195,8 @@ def parse_sdf_file_mol(path, heavy_only=True, mol=None):
         row += [start, end]
         col += [end, start]
         edge_type += 2 * [BOND_TYPES[bond.GetBondType()]]
-    edge_index = np.array([row, col], dtype=np.long)
-    edge_type = np.array(edge_type, dtype=np.long)
+    edge_index = np.array([row, col], dtype=np.int64)
+    edge_type = np.array(edge_type, dtype=np.int64)
     perm = (edge_index[0] * num_atoms + edge_index[1]).argsort()
     edge_index = edge_index[:, perm]
     edge_type = edge_type[perm]

@@ -225,6 +225,12 @@ def construct_flow_matching_dataset(
         # Encoded ligand atom type with hybridization and aromaticity.
         lig_full_element = lig['ligand_atom_feature_full']
         lig_coords = lig['pos']
+        # Directed chemical-bond graph. Each undirected RDKit bond is stored in
+        # both directions; bond types use the stable vocabulary documented in
+        # utils.rigid_utils (0=no bond, 1=single, 2=double, 3=triple,
+        # 4=aromatic, 5=other).
+        lig_bond_index = lig['edge_index']
+        lig_bond_type = lig['edge_type']
         # lig_coords_gt = deepcopy(lig_coords)
         # print(center)
         if ligand_center:
@@ -341,6 +347,8 @@ def construct_flow_matching_dataset(
             'p2': p2,  # p2 structure dict (after transformation)
             'lig_seq': np.asarray(lig_full_element, dtype=np.int32),
             'lig_coords': np.asarray(lig_coords, dtype=np.float32), # moved ligand coordinates
+            'lig_bond_index': np.asarray(lig_bond_index, dtype=np.int32),
+            'lig_bond_type': np.asarray(lig_bond_type, dtype=np.int32),
             'interface_flag': interface_flag,
         }
 
@@ -415,6 +423,53 @@ def filter_dataset_by_protein_length(dataset_path, output_path, min_length=50, m
     print(f"✓ Filtered dataset saved successfully!")
     
     return filtered_dataset
+
+
+def add_ligand_bonds_to_flow_dataset(
+    dataset_path,
+    ligand_data_dir,
+    output_path,
+    num_proc=8,
+):
+    """Add RDKit bond graphs to an already constructed flow dataset.
+
+    Reusing the existing dataset preserves its randomized P2 coordinates and
+    avoids reparsing both proteins. Atom ordering is checked against lig_seq so
+    a mismatched SDF can never silently attach bonds to the wrong atoms.
+    """
+    dataset = load_from_disk(dataset_path)
+
+    def add_bonds(example):
+        ligand_path = os.path.join(
+            ligand_data_dir, example['name'], 'ligand_rcsb.sdf'
+        )
+        ligand = parse_pdb_ligand(
+            ligand_path, heavy_only=True, mode='full'
+        )
+        num_dataset_atoms = len(example['lig_seq'])
+        num_sdf_atoms = len(ligand['element'])
+        if num_dataset_atoms != num_sdf_atoms:
+            raise ValueError(
+                f"Ligand atom-count mismatch for {example['name']}: "
+                f"dataset={num_dataset_atoms}, sdf={num_sdf_atoms}"
+            )
+        return {
+            'lig_bond_index': np.asarray(
+                ligand['edge_index'], dtype=np.int32
+            ),
+            'lig_bond_type': np.asarray(
+                ligand['edge_type'], dtype=np.int32
+            ),
+        }
+
+    dataset = dataset.map(
+        add_bonds,
+        num_proc=num_proc,
+        desc='Adding ligand bond graphs',
+    )
+    dataset.save_to_disk(output_path)
+    print(f"✓ Bond-augmented dataset saved to {output_path}")
+    return dataset
 
 def check_ligand(data_dir):
     complexes = []

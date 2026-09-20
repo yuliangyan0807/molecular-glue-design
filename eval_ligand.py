@@ -797,6 +797,12 @@ if __name__ == "__main__":
         help="Evaluate only the first N trajectories per sample (set <=0 to use all).",
     )
     parser.add_argument(
+        "--trajectory_start",
+        type=int,
+        default=0,
+        help="Zero-based first trajectory to evaluate before applying --max_trajectories.",
+    )
+    parser.add_argument(
         "--sefmol_refine",
         action="store_true",
         help="Refine reconstructed ligands with SeFMol using generated seq/coords as initialization.",
@@ -897,6 +903,8 @@ if __name__ == "__main__":
         "sefmol_condition_properties": (
             args.sefmol_condition_properties if args.sefmol_refine else None
         ),
+        "trajectory_start": args.trajectory_start,
+        "max_trajectories": args.max_trajectories,
     }
 
     vina_score_vals, vina_min_vals, vina_dock_vals, high_affinity_vals = [], [], [], []
@@ -951,11 +959,20 @@ if __name__ == "__main__":
                 f"seq={len(lig_seq_preds)} coords={len(lig_coords_all)}"
             )
 
+        trajectory_start = max(0, int(args.trajectory_start))
+        if trajectory_start >= len(lig_seq_preds):
+            raise ValueError(
+                f"trajectory_start={trajectory_start} is outside the available "
+                f"range for {item.get('name', '')} ({len(lig_seq_preds)} trajectories)"
+            )
         if args.max_trajectories is not None and int(args.max_trajectories) > 0:
-            max_traj = int(args.max_trajectories)
-            lig_seq_preds = lig_seq_preds[:max_traj]
-            lig_coords_all = lig_coords_all[:max_traj]
-        for traj_idx, (sample_seq, traj_coords) in enumerate(zip(lig_seq_preds, lig_coords_all)):
+            trajectory_end = trajectory_start + int(args.max_trajectories)
+        else:
+            trajectory_end = len(lig_seq_preds)
+        lig_seq_preds = lig_seq_preds[trajectory_start:trajectory_end]
+        lig_coords_all = lig_coords_all[trajectory_start:trajectory_end]
+        for local_traj_idx, (sample_seq, traj_coords) in enumerate(zip(lig_seq_preds, lig_coords_all)):
+            traj_idx = trajectory_start + local_traj_idx
             rdmol = None
             smiles = None
             qv, sv = None, None
