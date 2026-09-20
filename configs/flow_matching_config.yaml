@@ -13,6 +13,24 @@ model:
       seq_tfmr_num_layers: 2
       num_blocks: 2
       stop_grad: False
+    # One coupled equivariant trunk over [protein1, current protein2, ligand].
+    # Protein2 is first transformed by the current noisy (R_t, t_t) state.
+    unified_egnn:
+      hidden_dim: 128
+      num_layers: 4
+      num_nearest_neighbors: 32
+      # Per receiver, reserve this many directed neighbors from each of the
+      # other two entity types. Remaining slots are ordinary geometric KNN.
+      cross_entity_neighbors: 8
+      # Local multi-head P2->P1/ligand force and torque residual in PhiRT.
+      force_neighbors: 8
+      force_num_heads: 8
+      message_dim: 64
+      coor_weights_clamp_value: 2.0
+      coordinate_scale: 10.0
+      # Learned categorical embedding of the current noisy bond simplex state
+      # on ligand-ligand EGNN edges.
+      bond_edge_dim: 8
   interpolant:
     min_t: 1.e-2
     t_normalization_clip: 0.9
@@ -26,15 +44,26 @@ model:
       train_schedule: linear
       sample_schedule: linear
       sigma: 1.0
+      # Isotropic Angstrom scale for the translation vector field. Pose states
+      # and exported coordinates remain in Angstrom in both train and sample.
+      normalization_scale: 50.0
     seqs:
       simplex_value: 5.0
       num_classes: 25
+    bonds:
+      # 0=no bond, 1=single, 2=double, 3=triple, 4=aromatic, 5=other.
+      # Bonds use the same Gaussian-to-simplex flow as atom types.
+      simplex_value: 5.0
+      num_classes: 6
     sampling:
       num_timesteps: 50
     self_condition: False
   interface_model:
     path: ./checkpoints/interface-model/latest.pt  # Path to trained interface model checkpoint (set to null if not using pretrained model)
-    trainable: False  # Whether interface model parameters should be trainable (false = frozen)
+    # Required geometric conditioner: always used for Y1/Y2, covariance and
+    # Kabsch priors, but frozen so the RT target cannot move its own reference.
+    trainable: False
+    finetune_heads_only: True
     feat_dim: 128
     depth: 4
     num_nearest_neighbors: 16
@@ -42,36 +71,56 @@ model:
     topk_k: 25  # Top-k residues to select based on attention scores
 train:
   loss_weights:
-    trans_loss: 0.008
+    # Translation target is normalized by interpolant.trans.normalization_scale.
+    trans_loss: 1.0
     rot_loss: 1.0
     seqs_loss: 1.0
-    coords_loss: 10.0
+    # Balanced over bonded and no-bond atom pairs inside each molecule.
+    bond_loss: 1.0
+    coords_loss: 5.0
+    # FIXME(RT-DEBUG): keep these auxiliary weights small initially; monitor
+    # Kabsch pose errors and interface-gradient norms before increasing them.
+    # Kabsch values are logged as pose-quality metrics, but are detached from
+    # optimization because SVD backward is undefined for repeated singular values.
+    kabsch_rot_loss: 0.0
+    kabsch_trans_loss: 0.0
+    keypoint_match_loss: 0.0
+    # Endpoint docking loss in Angstrom: apply the predicted endpoint R/t to
+    # centered P2 and compare it with the final ground-truth docking result.
+    pose_coord_loss: 1.0
   max_epochs: 800
   val_freq: 1  # Validate every N epochs
   save_freq: 50  # Save checkpoint every N epochs (also saves at last epoch)
   num_val_samples: 5  # Number of samples to validate on (randomly selected from validation set)
   num_trajectories_per_sample: 4  # Number of trajectories to sample per sample
-  batch_size: 4
+  batch_size: 12
   accum_grad: 1
-  use_amp: False  # Use Automatic Mixed Precision (AMP) to reduce memory usage
+  use_amp: True
+  # L40 supports native BF16. It keeps AMP memory savings while avoiding the
+  # FP16 activation ceiling that caused forward NaNs at GradScaler scale=1.
+  amp_dtype: bfloat16
+  # Used only if amp_dtype is switched back to float16.
+  amp_init_scale: 4.0
+  amp_growth_interval: 2000
+  max_consecutive_nonfinite_batches: 8
   seed: 42
-  max_grad_norm: 50.0
+  max_grad_norm: 10.0
   optimizer:
     type: adam
-    lr: 5.e-4 #1.e-4
+    lr: 5.e-4
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
   scheduler:
     type: linear  # Options: plateau, cosine, linear, none
-    end_lr: 4.e-4  # Final learning rate for linear scheduler (only used when type=linear)
+    end_lr: 3.e-4  # Final learning rate for linear scheduler (only used when type=linear)
     # Plateau scheduler options (only used when type=plateau):
     # factor: 0.8
     # patience: 10
     # min_lr: 5.e-6
 
 dataset:
-  path: ./data/Moloctite/TernaryDataset_filtered # Path to load dataset from disk
+  path: ./data/Moloctite/TernaryDataset_bonds_filtered # Includes ligand bond graph
   # path: ./data/Moloctite/TernaryDataset # Path to load dataset from disk
-  train_split: 0.95  # Fraction of data for training
-  val_split: 0.05    # Fraction of data for validation
+  train_split: 0.99  # Fraction of data for training
+  val_split: 0.01    # Fraction of data for validation

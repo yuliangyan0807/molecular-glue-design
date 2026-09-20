@@ -12,7 +12,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 SCRIPT_PATH="${SCRIPT_PATH:-eval_ligand.py}"
 DETAILED_JSON="${DETAILED_JSON:-evaluation_results/detailed_results.json}"
 PDB_BASE_DIR="${PDB_BASE_DIR:-data/TernaryDB/MGD_test}"
-DATASET_PATH="${DATASET_PATH:-data/Moloctite/TernaryDataset_test}"
+DATASET_PATH="${DATASET_PATH:-data/Moloctite/TernaryDataset_test_bonds}"
 OUTPUT_JSON="${OUTPUT_JSON:-evaluation_results/ligand_eval_results.json}"
 
 # SeFMol refine parameters (set SEFMOL_REFINE=1 to enable)
@@ -30,7 +30,7 @@ HIGH_AFFINITY_THRESHOLD="${HIGH_AFFINITY_THRESHOLD:--7.0}"
 DOCK_EXHAUSTIVENESS="${DOCK_EXHAUSTIVENESS:-8}"
 DOCK_N_POSES="${DOCK_N_POSES:-20}"
 VINA_DEBUG="${VINA_DEBUG:-0}"  # 1 to enable --vina_debug
-VINA_TMP_DIR="${VINA_TMP_DIR:-/mnt/data/tmp}"
+VINA_TMP_DIR="${VINA_TMP_DIR:-${TMPDIR:-/tmp}/triglue_vina}"
 
 # Put Vina temp files on large disk and clean them after evaluation.
 export VINA_TMP_DIR

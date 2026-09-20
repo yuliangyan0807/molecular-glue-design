@@ -176,6 +176,10 @@ class MultiHeadInterfaceModel(nn.Module):
             nonlin_layer,
         )
     
+    # PhiRT can send large coordinate gradients back through this attention.
+    # FP16 softmax backward overflows even when its forward output is finite,
+    # so keep only the lightweight keypoint head in FP32 under CUDA AMP.
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def _generate_keypoints(self, feats1, coors1, feats2, coors2, mask1=None, mask2=None):
         """
         Generate K keypoints for each protein using cross-attention.
@@ -232,7 +236,8 @@ class MultiHeadInterfaceModel(nn.Module):
         if mask2 is not None:
             mask2_expanded = mask2.unsqueeze(1).unsqueeze(-1)  # (B, 1, N2, 1)
             mask2_expanded = mask2_expanded.expand(-1, K, -1, -1)  # (B, K, N2, 1)
-            att_scores_2 = att_scores_2.masked_fill(~mask2_expanded.bool(), -1e9)
+            # -1e9 is outside the FP16 range and raises during AMP autocast.
+            att_scores_2 = att_scores_2.masked_fill(~mask2_expanded.bool(), -1e4)
         
         attn2 = F.softmax(att_scores_2.squeeze(-1), dim=-1)  # (B, K, N2)
         
@@ -260,7 +265,7 @@ class MultiHeadInterfaceModel(nn.Module):
         if mask1 is not None:
             mask1_expanded = mask1.unsqueeze(1).unsqueeze(-1)  # (B, 1, N1, 1)
             mask1_expanded = mask1_expanded.expand(-1, K, -1, -1)  # (B, K, N1, 1)
-            att_scores_1 = att_scores_1.masked_fill(~mask1_expanded.bool(), -1e9)
+            att_scores_1 = att_scores_1.masked_fill(~mask1_expanded.bool(), -1e4)
         
         attn1 = F.softmax(att_scores_1.squeeze(-1), dim=-1)  # (B, K, N1)
         

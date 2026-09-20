@@ -5,11 +5,11 @@
 
 # Set paths (modify these according to your setup)
 CONFIG_PATH="${CONFIG_PATH:-configs/flow_matching_config.yaml}"  # Path to config YAML file
-PYTHON_BIN="${PYTHON_BIN:-/home/yuliangyan/anaconda3/envs/mgd/bin/python}"
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-checkpoints_20260831-224641/best.pt}"  # Path to model checkpoint
+PYTHON_BIN="${PYTHON_BIN:-python}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-triglue_ckpt/triglue_latest.pt}"  # Official paper/default checkpoint
 DATASET_PATH="${DATASET_PATH:-data/Moloctite/TernaryDataset_test_bonds}"  # Bond-aware test dataset
 PDB_BASE_DIR="${PDB_BASE_DIR:-data/TernaryDB/MGD_test}"  # Base directory containing PDB files
-OUTPUT_DIR="${OUTPUT_DIR:-./evaluation_results_20260904_checkpoints20260831_224641_best_100traj_100steps_8gpu}"  # Result directory
+OUTPUT_DIR="${OUTPUT_DIR:-./evaluation_results}"  # Result directory
 
 # Evaluation parameters
 DEVICE="${DEVICE:-cuda}"  # Device to use: cuda or cpu
