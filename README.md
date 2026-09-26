@@ -4,6 +4,8 @@
   <img src="assets/triglue_framework.png" width="100%" alt="TriGlue framework">
 </p>
 
+TriGlue is a biology-inspired generative framework for designing molecular-glue-induced ternary complexes from two unassembled protein structures. It first predicts a geometrically constrained, glue-mediated protein–protein interface, then uses an interface-conditioned ternary flow network to jointly generate the molecular glue and the target protein's rigid-body pose, assembling both proteins and the generated molecule into a coherent ternary complex.
+
 ## Environment
 
 TriGlue was tested with Python 3.10, PyTorch 2.6.0, and CUDA 12.4. A CUDA GPU is recommended; training and evaluation support multiple GPUs.
